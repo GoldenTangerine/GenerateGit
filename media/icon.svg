@@ -1,0 +1,20 @@
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background circle -->
+  <circle cx="64" cy="64" r="60" fill="#1a1a2e"/>
+
+  <!-- Git branch lines -->
+  <path d="M40 90 L40 50 L60 30" stroke="#e94560" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <path d="M40 70 L70 70" stroke="#e94560" stroke-width="4" stroke-linecap="round"/>
+
+  <!-- Git nodes -->
+  <circle cx="40" cy="90" r="6" fill="#e94560"/>
+  <circle cx="40" cy="70" r="6" fill="#e94560"/>
+  <circle cx="40" cy="50" r="6" fill="#e94560"/>
+  <circle cx="60" cy="30" r="6" fill="#e94560"/>
+  <circle cx="70" cy="70" r="6" fill="#e94560"/>
+
+  <!-- AI sparkle -->
+  <path d="M85 45 L88 55 L98 58 L88 61 L85 71 L82 61 L72 58 L82 55 Z" fill="#ffd700"/>
+  <path d="M95 30 L97 36 L103 38 L97 40 L95 46 L93 40 L87 38 L93 36 Z" fill="#ffd700"/>
+  <path d="M100 55 L101 59 L105 60 L101 61 L100 65 L99 61 L95 60 L99 59 Z" fill="#ffd700"/>
+</svg>

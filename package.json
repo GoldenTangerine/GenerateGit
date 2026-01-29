@@ -1,0 +1,91 @@
+{
+  "name": "generate-git-commit",
+  "displayName": "AI Git Commit Message Generator",
+  "description": "使用 AI 自动生成符合规范的 Git 提交消息",
+  "version": "1.0.0",
+  "publisher": "shumin",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "SCM Providers",
+    "Other"
+  ],
+  "keywords": [
+    "git",
+    "commit",
+    "ai",
+    "message",
+    "generator"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "generate-git-commit.generate",
+        "title": "生成 Git 提交消息",
+        "icon": "$(sparkle)",
+        "category": "Git"
+      }
+    ],
+    "menus": {
+      "scm/title": [
+        {
+          "command": "generate-git-commit.generate",
+          "group": "navigation",
+          "when": "scmProvider == git"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "AI Git Commit Message Generator",
+      "properties": {
+        "generateGitCommit.apiEndpoint": {
+          "type": "string",
+          "default": "https://api.openai.com/v1/chat/completions",
+          "description": "AI API 端点地址（支持 OpenAI 兼容接口，如 DeepSeek、智谱等）"
+        },
+        "generateGitCommit.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "AI API 密钥"
+        },
+        "generateGitCommit.model": {
+          "type": "string",
+          "default": "gpt-4o-mini",
+          "description": "使用的 AI 模型名称"
+        },
+        "generateGitCommit.customPrompt": {
+          "type": "string",
+          "default": "",
+          "description": "自定义 Prompt（留空使用默认 Prompt）"
+        },
+        "generateGitCommit.maxDiffLength": {
+          "type": "number",
+          "default": 10000,
+          "description": "最大 diff 内容长度（字符），超出将被截断"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "pnpm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "pnpm run compile",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "license": "MIT"
+}
