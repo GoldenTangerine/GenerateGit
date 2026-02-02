@@ -3,6 +3,8 @@
  * @author sm
  */
 
+import { extractChangedFilePaths } from './diff';
+
 /**
  * 提交类型与 Emoji 对照表
  */
@@ -22,22 +24,6 @@ export const COMMIT_TYPES = {
 } as const;
 
 /**
- * 从 diff 中提取变更文件路径（按 diff 顺序，保留 a/ 与 b/ 路径）
- */
-function extractChangedFilePaths(diff: string): string[] {
-  const files: string[] = [];
-  const regex = /^diff --git a\/(.+?) b\/(.+)$/gm;
-  let match: RegExpExecArray | null;
-
-  while ((match = regex.exec(diff)) !== null) {
-    files.push(`a/${match[1]}`);
-    files.push(`b/${match[2]}`);
-  }
-
-  return files;
-}
-
-/**
  * 生成默认的系统 Prompt
  */
 export function getDefaultPrompt(): string {
@@ -48,8 +34,13 @@ export function getDefaultPrompt(): string {
 \`\`\`
 <emoji> <type>(<scope>): <主题>
 
--（<路径>）：<变更描述>
--（<路径>）：<变更描述>
+修改内容：
+- <文件路径>：<变更描述>
+- <文件路径>：<变更描述>
+
+涉及组件：
+- <文件路径>
+- <文件路径>
 \`\`\`
 
 ## 规则
@@ -61,15 +52,19 @@ export function getDefaultPrompt(): string {
    - 主题使用中文，简洁描述变更内容，不超过 50 个字符
    - 不要以句号结尾
 
-2. **文件变更清单**（必填）：
+2. **修改内容**（必填）：
    - 与标题行之间空一行
-   - 使用列表逐行输出，每行格式：\`-（<路径>）：<变更描述>\`
-   - 路径必须来自 diff 中出现的 a/ 或 b/ 路径
-   - 每个变更文件至少 1 行；同一文件有多个变更点时可输出多行并重复路径
-   - 如需强调“修改前/后”，可分别使用 a/ 与 b/ 路径
+   - 使用列表逐行输出，每行格式：\`- <文件路径>：<变更描述>\`
+   - 路径必须来自下方“变更文件清单”
+   - 每个文件只输出 1 行，不要合并多个文件到一行
    - 每行不超过 72 个字符
 
-3. **Emoji 与 Type 对照表**：
+3. **涉及组件**（必填）：
+   - 与“修改内容”之间空一行
+   - 仅列出文件路径，每行一个路径，不要附带描述
+   - 顺序必须与“变更文件清单”一致
+
+4. **Emoji 与 Type 对照表**：
    | Emoji | Type | 说明 |
    |-------|------|------|
    | 🎉 | init | 项目初始化 |
@@ -119,9 +114,13 @@ index 2222222..3333333 100644
 \`\`\`
 ✨ feat(components): 增强表单交互
 
--（a/src/components/Button.vue）：为 Button 组件添加禁用状态的属性配置
--（b/src/components/Button.vue）：支持通过 props 控制按钮的可用状态
--（a/src/components/Input.vue）：调整 clearable 默认值
+修改内容：
+- src/components/Button.vue：为 Button 组件添加禁用状态 props
+- src/components/Input.vue：调整 clearable 默认值
+
+涉及组件：
+- src/components/Button.vue
+- src/components/Input.vue
 \`\`\`
 
 ## 要求
@@ -138,12 +137,22 @@ index 2222222..3333333 100644
  * @param diff Git diff 内容
  * @param customPrompt 用户自定义 Prompt
  */
-export function buildPrompt(diff: string, customPrompt?: string): string {
+export function buildPrompt(diff: string, customPrompt?: string, fileList?: string[]): string {
   const systemPrompt = customPrompt || getDefaultPrompt();
-  const changedFiles = extractChangedFilePaths(diff);
+  const changedFiles = (fileList && fileList.length > 0) ? fileList : extractChangedFilePaths(diff);
   const changedFilesSection = changedFiles.length > 0
     ? `## 变更文件清单（按 diff 顺序）
 
+${changedFiles.map((file) => `- ${file}`).join('\n')}
+
+## 输出模板（按文件一条填充，勿增删行）
+
+<emoji> <type>(<scope>): <主题>
+
+修改内容：
+${changedFiles.map((file) => `- ${file}：<一句话描述>`).join('\n')}
+
+涉及组件：
 ${changedFiles.map((file) => `- ${file}`).join('\n')}
 
 `

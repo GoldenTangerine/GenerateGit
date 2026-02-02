@@ -6,6 +6,7 @@
 import * as vscode from 'vscode';
 import * as logger from '../utils/logger';
 import { buildPrompt } from '../utils/prompt';
+import { extractChangedFilePaths } from '../utils/diff';
 
 /**
  * AI API 响应结构
@@ -125,11 +126,13 @@ export async function generateCommitMessage(diff: string): Promise<string> {
     throw new Error('未配置 API Key');
   }
 
+  const changedFiles = extractChangedFilePaths(diff);
+
   // 截断过长的 diff
   const truncatedDiff = truncateDiff(diff, config.maxDiffLength);
 
   // 构建 Prompt
-  const prompt = buildPrompt(truncatedDiff, config.customPrompt || undefined);
+  const prompt = buildPrompt(truncatedDiff, config.customPrompt || undefined, changedFiles);
 
   logger.info(`准备调用 AI API: ${apiEndpoint}, 模型: ${config.model}`);
 
@@ -189,13 +192,14 @@ export async function generateCommitMessage(diff: string): Promise<string> {
 
     // 清理可能的 markdown 代码块包裹
     const cleanedMessage = cleanMarkdownCodeBlock(message);
+    const normalizedMessage = appendInvolvedFilesSection(cleanedMessage, changedFiles);
 
     logger.info('成功生成提交消息');
     if (data.usage) {
       logger.info(`Token 使用: prompt=${data.usage.prompt_tokens}, completion=${data.usage.completion_tokens}`);
     }
 
-    return cleanedMessage;
+    return normalizedMessage;
   } catch (error) {
     if (error instanceof Error) {
       if (error.message.includes('fetch')) {
@@ -227,4 +231,22 @@ function cleanMarkdownCodeBlock(text: string): string {
   }
 
   return cleaned.trim();
+}
+
+/**
+ * 追加“涉及组件”列表（使用本地 diff 文件清单保证准确）
+ */
+function appendInvolvedFilesSection(message: string, files: string[]): string {
+  const trimmed = message.trim();
+  if (files.length === 0) {
+    return trimmed;
+  }
+
+  const sectionHeader = '涉及组件：';
+  const sectionBody = files.map((file) => `- ${file}`).join('\n');
+  const sectionRegex = new RegExp(`(^|\\n)${sectionHeader}[\\s\\S]*$`);
+  const base = trimmed.replace(sectionRegex, '').trim();
+  const prefix = base ? `${base}\n\n` : '';
+
+  return `${prefix}${sectionHeader}\n${sectionBody}`;
 }

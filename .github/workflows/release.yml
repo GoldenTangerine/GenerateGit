@@ -15,6 +15,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Sync version from tag
+        run: |
+          if [[ "${GITHUB_REF_NAME}" != v* ]]; then
+            echo "Tag must start with v, got: ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+          VERSION="${GITHUB_REF_NAME#v}"
+          export VERSION
+          node -e "const fs=require('fs'); const path='package.json'; const pkg=JSON.parse(fs.readFileSync(path,'utf8')); pkg.version=process.env.VERSION; fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n', 'utf8');"
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
