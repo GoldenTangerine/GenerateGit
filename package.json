@@ -85,6 +85,32 @@
           "type": "number",
           "default": 10000,
           "description": "最大 diff 内容长度（字符），超出将被截断"
+        },
+        "generateGitCommit.retryCount": {
+          "type": "number",
+          "default": 5,
+          "description": "自动重试次数（不包含首次请求）"
+        },
+        "generateGitCommit.retryStatusCodes": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "default": [
+            408,
+            429,
+            500,
+            502,
+            503,
+            504,
+            404
+          ],
+          "description": "触发自动重试的 HTTP 状态码列表"
+        },
+        "generateGitCommit.requestTimeoutMs": {
+          "type": "number",
+          "default": 60000,
+          "description": "API 请求超时时间（毫秒）"
         }
       }
     }

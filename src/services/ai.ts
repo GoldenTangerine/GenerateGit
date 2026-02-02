@@ -10,6 +10,14 @@ import { extractChangedFilePaths } from '../utils/diff';
 import { DEFAULT_REDACT_PATTERNS, redactSensitiveText } from '../utils/redact';
 import { DEFAULT_OUTPUT_TEMPLATE, renderOutputTemplate, resolveOutputTemplate } from '../utils/outputTemplate';
 
+const DEFAULT_RETRY_COUNT = 5;
+const DEFAULT_REQUEST_TIMEOUT_MS = 60000;
+const DEFAULT_RETRY_STATUS_CODES = [408, 429, 500, 502, 503, 504, 404];
+const RETRY_BASE_DELAY_MS = 500;
+const RETRY_MAX_DELAY_MS = 5000;
+const MAX_RETRY_AFTER_MS = 60000;
+const RETRYABLE_STATUS_HINT_THRESHOLD = 2;
+
 /**
  * AI API 响应结构
  */
@@ -45,7 +53,10 @@ function getConfig() {
     customPrompt: config.get<string>('customPrompt') || '',
     outputTemplate: config.get<string>('outputTemplate') || '',
     redactPatterns: config.get<string[]>('redactPatterns') || [],
-    maxDiffLength: config.get<number>('maxDiffLength') || 10000
+    maxDiffLength: config.get<number>('maxDiffLength') || 10000,
+    retryCount: resolveRetryCount(config.get<number>('retryCount')),
+    requestTimeoutMs: resolveTimeoutMs(config.get<number>('requestTimeoutMs')),
+    retryStatusCodes: resolveRetryStatusCodes(config.get<number[]>('retryStatusCodes'))
   };
 }
 
@@ -105,6 +116,179 @@ function truncateDiff(diff: string, maxLength: number): string {
   return truncated + '\n\n... (部分内容已省略)';
 }
 
+function resolveRetryCount(value: number | undefined): number {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return DEFAULT_RETRY_COUNT;
+  }
+  return Math.max(0, Math.floor(value));
+}
+
+function resolveTimeoutMs(value: number | undefined): number {
+  if (typeof value !== 'number' || Number.isNaN(value) || value <= 0) {
+    return DEFAULT_REQUEST_TIMEOUT_MS;
+  }
+  return Math.floor(value);
+}
+
+function resolveRetryStatusCodes(value: number[] | undefined): number[] {
+  if (!Array.isArray(value)) {
+    return [...DEFAULT_RETRY_STATUS_CODES];
+  }
+  if (value.length === 0) {
+    return [];
+  }
+
+  const normalized = value
+    .map((code) => Number(code))
+    .filter((code) => Number.isInteger(code) && code >= 100 && code <= 599);
+  const unique = Array.from(new Set(normalized));
+
+  if (unique.length === 0) {
+    logger.warn('retryStatusCodes 配置无有效状态码，已回退默认配置');
+    return [...DEFAULT_RETRY_STATUS_CODES];
+  }
+
+  return unique;
+}
+
+function isRetryableStatus(status: number, retryableStatusCodes: Set<number>): boolean {
+  return retryableStatusCodes.has(status);
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError';
+}
+
+function isRetryableFetchError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  if (isAbortError(error)) {
+    return true;
+  }
+  const message = error.message.toLowerCase();
+  if (message.includes('invalid url') || message.includes('only absolute urls')) {
+    return false;
+  }
+  return (
+    message.includes('fetch') ||
+    message.includes('network') ||
+    message.includes('timeout') ||
+    message.includes('econn') ||
+    message.includes('socket')
+  );
+}
+
+function getRetryDelayMs(attempt: number): number {
+  const baseDelay = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1), RETRY_MAX_DELAY_MS);
+  const jitter = Math.floor(Math.random() * 200);
+  return baseDelay + jitter;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function discardResponseBody(response: Response): void {
+  try {
+    response.body?.cancel();
+  } catch {
+    // ignore: best-effort cleanup
+  }
+}
+
+function parseRetryAfterHeader(value: string | null): number | null {
+  if (!value) {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const seconds = Number(trimmed);
+  if (!Number.isNaN(seconds) && seconds >= 0) {
+    return Math.min(seconds * 1000, MAX_RETRY_AFTER_MS);
+  }
+
+  const dateMs = Date.parse(trimmed);
+  if (!Number.isNaN(dateMs)) {
+    const delayMs = dateMs - Date.now();
+    if (delayMs > 0) {
+      return Math.min(delayMs, MAX_RETRY_AFTER_MS);
+    }
+  }
+
+  return null;
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function requestWithRetry(
+  url: string,
+  init: RequestInit,
+  options: { retryCount: number; timeoutMs: number; retryStatusCodes: Set<number> }
+): Promise<Response> {
+  const maxAttempts = options.retryCount + 1;
+  let consecutiveNotFound = 0;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const response = await fetchWithTimeout(url, init, options.timeoutMs);
+
+      if (
+        !response.ok &&
+        isRetryableStatus(response.status, options.retryStatusCodes) &&
+        attempt < maxAttempts
+      ) {
+        if (response.status === 404) {
+          consecutiveNotFound += 1;
+          if (consecutiveNotFound >= RETRYABLE_STATUS_HINT_THRESHOLD) {
+            logger.warn('连续出现 404，请检查 API 端点或模型名称是否正确');
+          }
+        } else {
+          consecutiveNotFound = 0;
+        }
+
+        const retryAfterMs = parseRetryAfterHeader(response.headers.get('retry-after'));
+        const delayMs = Math.max(getRetryDelayMs(attempt), retryAfterMs ?? 0);
+        logger.warn(
+          `API 请求返回 ${response.status}，${delayMs}ms 后重试 (${attempt}/${maxAttempts - 1})`
+        );
+        discardResponseBody(response);
+        await sleep(delayMs);
+        continue;
+      }
+
+      consecutiveNotFound = 0;
+      return response;
+    } catch (error) {
+      if (attempt < maxAttempts && isRetryableFetchError(error)) {
+        const delayMs = getRetryDelayMs(attempt);
+        const reason = isAbortError(error) ? '请求超时' : '网络异常';
+        logger.warn(`${reason}，${delayMs}ms 后重试 (${attempt}/${maxAttempts - 1})`);
+        await sleep(delayMs);
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  throw new Error('API 请求失败');
+}
+
 /**
  * 调用 AI API 生成提交消息
  */
@@ -151,10 +335,15 @@ export async function generateCommitMessage(diff: string): Promise<string> {
     outputTemplate: resolvedTemplate
   });
 
-  logger.info(`准备调用 AI API: ${apiEndpoint}, 模型: ${config.model}`);
+  const retryStatusLabel = config.retryStatusCodes.length > 0
+    ? config.retryStatusCodes.join(', ')
+    : '无';
+  logger.info(
+    `准备调用 AI API: ${apiEndpoint}, 模型: ${config.model}, 重试: ${config.retryCount} 次, 超时: ${config.requestTimeoutMs}ms, 重试状态码: ${retryStatusLabel}`
+  );
 
   try {
-    const response = await fetch(apiEndpoint, {
+    const response = await requestWithRetry(apiEndpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -171,6 +360,10 @@ export async function generateCommitMessage(diff: string): Promise<string> {
         temperature: 0.7,
         max_tokens: 500
       })
+    }, {
+      retryCount: config.retryCount,
+      timeoutMs: config.requestTimeoutMs,
+      retryStatusCodes: new Set(config.retryStatusCodes)
     });
 
     if (!response.ok) {
@@ -219,6 +412,9 @@ export async function generateCommitMessage(diff: string): Promise<string> {
     return normalizedMessage;
   } catch (error) {
     if (error instanceof Error) {
+      if (error.name === 'AbortError') {
+        throw new Error(`API 请求超时（${config.requestTimeoutMs}ms），请稍后重试或检查网络环境`);
+      }
       if (error.message.includes('fetch')) {
         throw new Error('网络请求失败，请检查网络连接和 API 端点配置');
       }

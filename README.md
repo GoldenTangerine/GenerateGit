@@ -44,6 +44,9 @@ pnpm run package
 | `outputTemplate` | 输出模板（支持 `{title}`、`{changes}`、`{files}`） | - |
 | `redactPatterns` | diff 脱敏正则列表 | 预置常见模式 |
 | `maxDiffLength` | 最大 diff 长度 | `10000` |
+| `retryCount` | 自动重试次数（不包含首次请求） | `5` |
+| `retryStatusCodes` | 触发自动重试的 HTTP 状态码列表 | `408, 429, 500, 502, 503, 504, 404` |
+| `requestTimeoutMs` | API 请求超时时间（毫秒） | `60000` |
 
 ### 配置示例
 
@@ -81,6 +84,21 @@ pnpm run package
   ]
 }
 ```
+
+**自定义重试与超时：**
+```json
+{
+  "generateGitCommit.retryCount": 5,
+  "generateGitCommit.retryStatusCodes": [408, 429, 500, 502, 503, 504, 404],
+  "generateGitCommit.requestTimeoutMs": 60000
+}
+```
+`retryStatusCodes` 填 HTTP 状态码数组即可；如需关闭按状态码重试可设为 `[]`（仍会对网络/超时重试）。
+
+**重试说明：**
+- 遇到可重试状态码时会先释放响应体，再等待后重试，避免连接占用。
+- 若服务端返回 `Retry-After`，会优先遵从该等待时间（与退避时间取更大值）。
+- 连续出现 404 会提示检查 API 端点或模型名称配置。
 
 ## 使用方法
 
