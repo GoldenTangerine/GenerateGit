@@ -4,6 +4,7 @@
  */
 
 import { extractChangedFilePaths } from './diff';
+import { buildOutputTemplatePreview, resolveOutputTemplate } from './outputTemplate';
 
 /**
  * 提交类型与 Emoji 对照表
@@ -64,7 +65,10 @@ export function getDefaultPrompt(): string {
    - 仅列出文件路径，每行一个路径，不要附带描述
    - 顺序必须与“变更文件清单”一致
 
-4. **Emoji 与 Type 对照表**：
+4. **输出格式约束**：
+   - 必须严格按照“输出模板”输出，不得增删行或改动段落结构
+
+5. **Emoji 与 Type 对照表**：
    | Emoji | Type | 说明 |
    |-------|------|------|
    | 🎉 | init | 项目初始化 |
@@ -135,11 +139,22 @@ index 2222222..3333333 100644
 /**
  * 构建完整的 Prompt
  * @param diff Git diff 内容
- * @param customPrompt 用户自定义 Prompt
+ * @param options 构建参数
  */
-export function buildPrompt(diff: string, customPrompt?: string, fileList?: string[]): string {
-  const systemPrompt = customPrompt || getDefaultPrompt();
-  const changedFiles = (fileList && fileList.length > 0) ? fileList : extractChangedFilePaths(diff);
+export function buildPrompt(
+  diff: string,
+  options: {
+    customPrompt?: string;
+    fileList?: string[];
+    outputTemplate?: string;
+  } = {}
+): string {
+  const systemPrompt = options.customPrompt || getDefaultPrompt();
+  const changedFiles = (options.fileList && options.fileList.length > 0)
+    ? options.fileList
+    : extractChangedFilePaths(diff);
+  const resolvedTemplate = resolveOutputTemplate(options.outputTemplate);
+  const outputTemplate = buildOutputTemplatePreview(resolvedTemplate, changedFiles);
   const changedFilesSection = changedFiles.length > 0
     ? `## 变更文件清单（按 diff 顺序）
 
@@ -147,13 +162,7 @@ ${changedFiles.map((file) => `- ${file}`).join('\n')}
 
 ## 输出模板（按文件一条填充，勿增删行）
 
-<emoji> <type>(<scope>): <主题>
-
-修改内容：
-${changedFiles.map((file) => `- ${file}：<一句话描述>`).join('\n')}
-
-涉及组件：
-${changedFiles.map((file) => `- ${file}`).join('\n')}
+${outputTemplate}
 
 `
     : '';

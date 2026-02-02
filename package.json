@@ -63,6 +63,24 @@
           "default": "",
           "description": "自定义 Prompt（留空使用默认 Prompt）"
         },
+        "generateGitCommit.outputTemplate": {
+          "type": "string",
+          "default": "{title}\n\n修改内容：\n{changes}\n\n涉及组件：\n{files}",
+          "description": "输出模板，支持占位符 {title}、{changes}、{files}"
+        },
+        "generateGitCommit.redactPatterns": {
+          "type": "array",
+          "default": [
+            "-----BEGIN [^-]+ PRIVATE KEY-----[\\s\\S]*?-----END [^-]+ PRIVATE KEY-----",
+            "sk-[A-Za-z0-9]{16,}",
+            "ghp_[A-Za-z0-9]{36}",
+            "github_pat_[A-Za-z0-9_]{22,}",
+            "xox[baprs]-[A-Za-z0-9-]{10,}",
+            "eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+",
+            "(?:api|access|secret|token)[_-]?key\\s*[:=]\\s*[\\\"']?[A-Za-z0-9_\\-]{16,}[\\\"']?"
+          ],
+          "description": "敏感信息脱敏正则列表（应用于 diff 内容）"
+        },
         "generateGitCommit.maxDiffLength": {
           "type": "number",
           "default": 10000,

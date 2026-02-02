@@ -7,6 +7,8 @@ import * as vscode from 'vscode';
 import * as logger from '../utils/logger';
 import { buildPrompt } from '../utils/prompt';
 import { extractChangedFilePaths } from '../utils/diff';
+import { DEFAULT_REDACT_PATTERNS, redactSensitiveText } from '../utils/redact';
+import { DEFAULT_OUTPUT_TEMPLATE, renderOutputTemplate, resolveOutputTemplate } from '../utils/outputTemplate';
 
 /**
  * AI API 响应结构
@@ -41,6 +43,8 @@ function getConfig() {
     apiKey: config.get<string>('apiKey') || '',
     model: config.get<string>('model') || 'gpt-4o-mini',
     customPrompt: config.get<string>('customPrompt') || '',
+    outputTemplate: config.get<string>('outputTemplate') || '',
+    redactPatterns: config.get<string[]>('redactPatterns') || [],
     maxDiffLength: config.get<number>('maxDiffLength') || 10000
   };
 }
@@ -127,12 +131,25 @@ export async function generateCommitMessage(diff: string): Promise<string> {
   }
 
   const changedFiles = extractChangedFilePaths(diff);
+  const patterns = config.redactPatterns.length > 0 ? config.redactPatterns : DEFAULT_REDACT_PATTERNS;
+  const redactionResult = redactSensitiveText(diff, patterns);
+  if (redactionResult.invalidPatterns.length > 0) {
+    logger.warn(`存在无效的脱敏正则：${redactionResult.invalidPatterns.join(', ')}`);
+  }
+  const resolvedTemplate = resolveOutputTemplate(config.outputTemplate || undefined);
+  if (config.outputTemplate && resolvedTemplate === DEFAULT_OUTPUT_TEMPLATE) {
+    logger.warn('outputTemplate 缺少必要占位符，已回退为默认模板');
+  }
 
   // 截断过长的 diff
-  const truncatedDiff = truncateDiff(diff, config.maxDiffLength);
+  const truncatedDiff = truncateDiff(redactionResult.text, config.maxDiffLength);
 
   // 构建 Prompt
-  const prompt = buildPrompt(truncatedDiff, config.customPrompt || undefined, changedFiles);
+  const prompt = buildPrompt(truncatedDiff, {
+    customPrompt: config.customPrompt || undefined,
+    fileList: changedFiles,
+    outputTemplate: resolvedTemplate
+  });
 
   logger.info(`准备调用 AI API: ${apiEndpoint}, 模型: ${config.model}`);
 
@@ -192,7 +209,7 @@ export async function generateCommitMessage(diff: string): Promise<string> {
 
     // 清理可能的 markdown 代码块包裹
     const cleanedMessage = cleanMarkdownCodeBlock(message);
-    const normalizedMessage = appendInvolvedFilesSection(cleanedMessage, changedFiles);
+    const normalizedMessage = normalizeCommitMessage(cleanedMessage, changedFiles, resolvedTemplate);
 
     logger.info('成功生成提交消息');
     if (data.usage) {
@@ -236,17 +253,92 @@ function cleanMarkdownCodeBlock(text: string): string {
 /**
  * 追加“涉及组件”列表（使用本地 diff 文件清单保证准确）
  */
-function appendInvolvedFilesSection(message: string, files: string[]): string {
+function normalizeCommitMessage(message: string, files: string[], template: string): string {
   const trimmed = message.trim();
+  const title = extractTitle(trimmed) || '🐳 chore: 更新提交信息';
+
   if (files.length === 0) {
-    return trimmed;
+    return title;
   }
 
-  const sectionHeader = '涉及组件：';
-  const sectionBody = files.map((file) => `- ${file}`).join('\n');
-  const sectionRegex = new RegExp(`(^|\\n)${sectionHeader}[\\s\\S]*$`);
-  const base = trimmed.replace(sectionRegex, '').trim();
-  const prefix = base ? `${base}\n\n` : '';
+  const descriptionMap = extractFileDescriptions(trimmed, files);
+  const changeLines = files.map((file) => {
+    const description = descriptionMap.get(file) || buildFallbackDescription(file);
+    return `- ${file}：${description}`;
+  });
 
-  return `${prefix}${sectionHeader}\n${sectionBody}`;
+  return renderOutputTemplate(template, title, changeLines, files);
+}
+
+function extractTitle(message: string): string | undefined {
+  const lines = message.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (lines.length === 0) {
+    return undefined;
+  }
+
+  const candidate = lines[0];
+  if (candidate.startsWith('-') || candidate === '修改内容：' || candidate === '涉及组件：') {
+    return undefined;
+  }
+
+  return candidate;
+}
+
+function extractFileDescriptions(message: string, files: string[]): Map<string, string> {
+  const fileSet = new Set(files);
+  const descriptions = new Map<string, string>();
+  const lines = message.split(/\r?\n/);
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('-')) {
+      continue;
+    }
+
+    const match = trimmed.match(/^-+\s*(.+?)\s*[:：]\s*(.+)$/);
+    if (!match) {
+      continue;
+    }
+
+    const pathToken = normalizePathToken(match[1]);
+    const description = match[2].trim();
+    if (!description) {
+      continue;
+    }
+
+    if (fileSet.has(pathToken) && !descriptions.has(pathToken)) {
+      descriptions.set(pathToken, description);
+    }
+  }
+
+  return descriptions;
+}
+
+function normalizePathToken(value: string): string {
+  let normalized = value.trim();
+  if (normalized.startsWith('./')) {
+    normalized = normalized.slice(2);
+  }
+  if (normalized.startsWith('a/')) {
+    normalized = normalized.slice(2);
+  } else if (normalized.startsWith('b/')) {
+    normalized = normalized.slice(2);
+  }
+
+  return normalized;
+}
+
+function buildFallbackDescription(file: string): string {
+  const name = file.split('/').pop() || file;
+  if (name.endsWith('.vue')) {
+    return `调整 ${name.replace('.vue', '')} 组件逻辑`;
+  }
+  if (name.endsWith('.ts')) {
+    return `优化 ${name.replace('.ts', '')} 相关实现`;
+  }
+  if (name.endsWith('.js')) {
+    return `更新 ${name.replace('.js', '')} 相关逻辑`;
+  }
+
+  return `更新 ${name} 相关逻辑`;
 }

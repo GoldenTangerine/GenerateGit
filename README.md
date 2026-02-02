@@ -41,6 +41,8 @@ pnpm run package
 | `apiKey` | AI API 密钥 | - |
 | `model` | 使用的模型名称 | `gpt-4o-mini` |
 | `customPrompt` | 自定义 Prompt | - |
+| `outputTemplate` | 输出模板（支持 `{title}`、`{changes}`、`{files}`） | - |
+| `redactPatterns` | diff 脱敏正则列表 | 预置常见模式 |
 | `maxDiffLength` | 最大 diff 长度 | `10000` |
 
 ### 配置示例
@@ -60,6 +62,23 @@ pnpm run package
   "generateGitCommit.apiEndpoint": "https://api.deepseek.com/v1/chat/completions",
   "generateGitCommit.apiKey": "sk-xxx",
   "generateGitCommit.model": "deepseek-chat"
+}
+```
+
+**自定义输出模板：**
+```json
+{
+  "generateGitCommit.outputTemplate": "{title}\n\n修改内容：\n{changes}\n\n涉及组件：\n{files}"
+}
+```
+
+**自定义脱敏正则：**
+```json
+{
+  "generateGitCommit.redactPatterns": [
+    "sk-[A-Za-z0-9]{16,}",
+    "eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+"
+  ]
 }
 ```
 
