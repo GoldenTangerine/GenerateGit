@@ -22,6 +22,22 @@ export const COMMIT_TYPES = {
 } as const;
 
 /**
+ * 从 diff 中提取变更文件路径（按 diff 顺序，保留 a/ 与 b/ 路径）
+ */
+function extractChangedFilePaths(diff: string): string[] {
+  const files: string[] = [];
+  const regex = /^diff --git a\/(.+?) b\/(.+)$/gm;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(diff)) !== null) {
+    files.push(`a/${match[1]}`);
+    files.push(`b/${match[2]}`);
+  }
+
+  return files;
+}
+
+/**
  * 生成默认的系统 Prompt
  */
 export function getDefaultPrompt(): string {
@@ -32,7 +48,8 @@ export function getDefaultPrompt(): string {
 \`\`\`
 <emoji> <type>(<scope>): <主题>
 
-<正文>
+-（<路径>）：<变更描述>
+-（<路径>）：<变更描述>
 \`\`\`
 
 ## 规则
@@ -44,9 +61,12 @@ export function getDefaultPrompt(): string {
    - 主题使用中文，简洁描述变更内容，不超过 50 个字符
    - 不要以句号结尾
 
-2. **正文**（可选）：
+2. **文件变更清单**（必填）：
    - 与标题行之间空一行
-   - 使用中文描述变更的原因和影响
+   - 使用列表逐行输出，每行格式：\`-（<路径>）：<变更描述>\`
+   - 路径必须来自 diff 中出现的 a/ 或 b/ 路径
+   - 每个变更文件至少 1 行；同一文件有多个变更点时可输出多行并重复路径
+   - 如需强调“修改前/后”，可分别使用 a/ 与 b/ 路径
    - 每行不超过 72 个字符
 
 3. **Emoji 与 Type 对照表**：
@@ -82,13 +102,26 @@ index 1234567..abcdefg 100644
 +    }
    }
  }
+diff --git a/src/components/Input.vue b/src/components/Input.vue
+index 2222222..3333333 100644
+--- a/src/components/Input.vue
++++ b/src/components/Input.vue
+@@ -12,7 +12,7 @@ export default {
+   props: {
+     value: String,
+-    clearable: false
++    clearable: true
+   }
+ }
 \`\`\`
 
 输出：
 \`\`\`
-✨ feat(Button): 添加 disabled 属性支持
+✨ feat(components): 增强表单交互
 
-为 Button 组件添加禁用状态的属性配置，支持通过 props 控制按钮的可用状态
+-（a/src/components/Button.vue）：为 Button 组件添加禁用状态的属性配置
+-（b/src/components/Button.vue）：支持通过 props 控制按钮的可用状态
+-（a/src/components/Input.vue）：调整 clearable 默认值
 \`\`\`
 
 ## 要求
@@ -107,10 +140,18 @@ index 1234567..abcdefg 100644
  */
 export function buildPrompt(diff: string, customPrompt?: string): string {
   const systemPrompt = customPrompt || getDefaultPrompt();
+  const changedFiles = extractChangedFilePaths(diff);
+  const changedFilesSection = changedFiles.length > 0
+    ? `## 变更文件清单（按 diff 顺序）
+
+${changedFiles.map((file) => `- ${file}`).join('\n')}
+
+`
+    : '';
 
   return `${systemPrompt}
 
-## Git Diff 内容
+${changedFilesSection}## Git Diff 内容
 
 \`\`\`diff
 ${diff}
