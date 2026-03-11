@@ -10,13 +10,20 @@ import { extractChangedFilePaths } from '../utils/diff';
 import { DEFAULT_REDACT_PATTERNS, redactSensitiveText } from '../utils/redact';
 import { DEFAULT_OUTPUT_TEMPLATE, renderOutputTemplate, resolveOutputTemplate } from '../utils/outputTemplate';
 
+type ApiMode = 'auto' | 'chat-completions' | 'responses';
+type ResolvedApiMode = Exclude<ApiMode, 'auto'>;
+
 const DEFAULT_RETRY_COUNT = 5;
 const DEFAULT_REQUEST_TIMEOUT_MS = 60000;
-const DEFAULT_RETRY_STATUS_CODES = [408, 429, 500, 502, 503, 504, 404];
+const DEFAULT_RETRY_STATUS_CODES = [408, 429, 500, 502, 503, 504];
 const RETRY_BASE_DELAY_MS = 500;
 const RETRY_MAX_DELAY_MS = 5000;
 const MAX_RETRY_AFTER_MS = 60000;
 const RETRYABLE_STATUS_HINT_THRESHOLD = 2;
+const DEFAULT_API_ENDPOINT = 'https://api.openai.com/v1';
+const DEFAULT_MODEL = 'gpt-4o-mini';
+const DEFAULT_API_MODE: ApiMode = 'auto';
+const OPENAI_API_HOSTS = new Set(['api.openai.com']);
 
 /**
  * AI API 响应结构
@@ -41,15 +48,59 @@ interface ChatCompletionResponse {
   };
 }
 
+interface ResponsesApiResponse {
+  id: string;
+  object: string;
+  created_at?: number;
+  model: string;
+  output_text?: string;
+  output?: Array<{
+    type: string;
+    role?: string;
+    content?: Array<{
+      type: string;
+      text?: string;
+    }>;
+  }>;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+    prompt_tokens?: number;
+    completion_tokens?: number;
+  };
+}
+
+interface GenerateCommitConfig {
+  apiEndpoint: string;
+  apiKey: string;
+  model: string;
+  apiMode: ApiMode;
+  customPrompt: string;
+  outputTemplate: string;
+  redactPatterns: string[];
+  maxDiffLength: number;
+  retryCount: number;
+  requestTimeoutMs: number;
+  retryStatusCodes: number[];
+}
+
+interface ResolvedApiTarget {
+  endpoint: string;
+  mode: ResolvedApiMode;
+  isOfficialOpenAiHost: boolean;
+}
+
 /**
  * 获取扩展配置
  */
-function getConfig() {
+function getConfig(): GenerateCommitConfig {
   const config = vscode.workspace.getConfiguration('generateGitCommit');
   return {
-    apiEndpoint: config.get<string>('apiEndpoint') || 'https://api.openai.com/v1/chat/completions',
+    apiEndpoint: config.get<string>('apiEndpoint') || DEFAULT_API_ENDPOINT,
     apiKey: config.get<string>('apiKey') || '',
-    model: config.get<string>('model') || 'gpt-4o-mini',
+    model: config.get<string>('model') || DEFAULT_MODEL,
+    apiMode: resolveApiMode(config.get<string>('apiMode')),
     customPrompt: config.get<string>('customPrompt') || '',
     outputTemplate: config.get<string>('outputTemplate') || '',
     redactPatterns: config.get<string[]>('redactPatterns') || [],
@@ -61,12 +112,16 @@ function getConfig() {
 }
 
 /**
- * 规范化 API 端点，兼容 base URL 配置
+ * 规范化 API 端点，并推断实际调用模式
  */
-function normalizeApiEndpoint(endpoint: string): string {
+function resolveApiTarget(endpoint: string, configuredMode: ApiMode): ResolvedApiTarget {
   const trimmed = endpoint.trim();
   if (!trimmed) {
-    return trimmed;
+    return {
+      endpoint: trimmed,
+      mode: configuredMode === 'responses' ? 'responses' : 'chat-completions',
+      isOfficialOpenAiHost: false
+    };
   }
 
   try {
@@ -74,25 +129,94 @@ function normalizeApiEndpoint(endpoint: string): string {
     const rawPath = url.pathname || '/';
     const path = rawPath.replace(/\/+$/, '');
     const lowerPath = path.toLowerCase();
+    const explicitMode = detectApiModeFromPath(lowerPath);
+    const officialOpenAiHost = isOfficialOpenAiHost(url.hostname);
+    const mode = resolveRequestedApiMode(configuredMode, url, explicitMode);
 
-    if (lowerPath.endsWith('/chat/completions')) {
-      return url.toString();
+    if (explicitMode) {
+      if (configuredMode !== 'auto' && explicitMode !== mode) {
+        url.pathname = replaceApiEndpointPath(path, mode);
+      }
+      return {
+        endpoint: url.toString(),
+        mode,
+        isOfficialOpenAiHost: officialOpenAiHost
+      };
     }
 
-    if (lowerPath === '' || lowerPath === '/') {
-      url.pathname = '/v1/chat/completions';
-      return url.toString();
+    if (lowerPath === '' || lowerPath === '/' || lowerPath.endsWith('/v1')) {
+      url.pathname = buildApiEndpointPath(path, mode);
     }
 
-    if (lowerPath.endsWith('/v1')) {
-      url.pathname = `${path}/chat/completions`;
-      return url.toString();
-    }
-
-    return url.toString();
+    return {
+      endpoint: url.toString(),
+      mode,
+      isOfficialOpenAiHost: officialOpenAiHost
+    };
   } catch {
-    return trimmed;
+    return {
+      endpoint: trimmed,
+      mode: configuredMode === 'responses' ? 'responses' : 'chat-completions',
+      isOfficialOpenAiHost: false
+    };
   }
+}
+
+function resolveApiMode(value: string | undefined): ApiMode {
+  if (value === 'auto' || value === 'chat-completions' || value === 'responses') {
+    return value;
+  }
+  if (typeof value === 'string' && value.trim()) {
+    logger.warn(`apiMode 配置无效: ${value}，已回退为 ${DEFAULT_API_MODE}`);
+  }
+  return DEFAULT_API_MODE;
+}
+
+function detectApiModeFromPath(path: string): ResolvedApiMode | undefined {
+  if (path.endsWith('/chat/completions')) {
+    return 'chat-completions';
+  }
+  if (path.endsWith('/responses')) {
+    return 'responses';
+  }
+  return undefined;
+}
+
+function resolveRequestedApiMode(
+  configuredMode: ApiMode,
+  url: URL,
+  explicitMode?: ResolvedApiMode
+): ResolvedApiMode {
+  if (configuredMode !== 'auto') {
+    return configuredMode;
+  }
+  if (explicitMode) {
+    return explicitMode;
+  }
+  return isOfficialOpenAiHost(url.hostname) ? 'responses' : 'chat-completions';
+}
+
+function buildApiEndpointPath(path: string, mode: ResolvedApiMode): string {
+  const endpointSuffix = mode === 'responses' ? 'responses' : 'chat/completions';
+  if (!path || path === '/') {
+    return `/v1/${endpointSuffix}`;
+  }
+  return `${path}/${endpointSuffix}`;
+}
+
+function replaceApiEndpointPath(path: string, mode: ResolvedApiMode): string {
+  const nextPath = mode === 'responses' ? '/responses' : '/chat/completions';
+  if (/\/responses$/i.test(path)) {
+    return path.replace(/\/responses$/i, nextPath);
+  }
+  if (/\/chat\/completions$/i.test(path)) {
+    return path.replace(/\/chat\/completions$/i, nextPath);
+  }
+  return path;
+}
+
+function isOfficialOpenAiHost(hostname: string): boolean {
+  return OPENAI_API_HOSTS.has(hostname.toLowerCase());
 }
 
 /**
@@ -222,6 +346,110 @@ function parseRetryAfterHeader(value: string | null): number | null {
   return null;
 }
 
+function buildRequestPayload(target: ResolvedApiTarget, model: string, prompt: string): Record<string, unknown> {
+  const openAiStorePayload = target.isOfficialOpenAiHost ? { store: false } : {};
+
+  if (target.mode === 'responses') {
+    return {
+      model,
+      input: [
+        {
+          role: 'user',
+          content: prompt
+        }
+      ],
+      temperature: 0.7,
+      max_output_tokens: 500,
+      ...openAiStorePayload
+    };
+  }
+
+  return {
+    model,
+    messages: [
+      {
+        role: 'user',
+        content: prompt
+      }
+    ],
+    temperature: 0.7,
+    max_tokens: 500,
+    ...openAiStorePayload
+  };
+}
+
+function extractGeneratedText(mode: ResolvedApiMode, data: ChatCompletionResponse | ResponsesApiResponse): string {
+  if (mode === 'responses') {
+    return extractResponsesText(data as ResponsesApiResponse);
+  }
+  return extractChatCompletionText(data as ChatCompletionResponse);
+}
+
+function extractChatCompletionText(data: ChatCompletionResponse): string {
+  if (!data.choices || data.choices.length === 0) {
+    throw new Error('API 返回结果为空');
+  }
+
+  const message = data.choices[0].message.content?.trim();
+  if (!message) {
+    throw new Error('API 返回结果为空');
+  }
+
+  return message;
+}
+
+function extractResponsesText(data: ResponsesApiResponse): string {
+  if (typeof data.output_text === 'string' && data.output_text.trim()) {
+    return data.output_text.trim();
+  }
+
+  if (!Array.isArray(data.output) || data.output.length === 0) {
+    throw new Error('API 返回结果为空');
+  }
+
+  const messageText = data.output
+    .filter((item) => item.type === 'message' && Array.isArray(item.content))
+    .flatMap((item) => item.content ?? [])
+    .filter((item) => item.type === 'output_text' && typeof item.text === 'string')
+    .map((item) => item.text?.trim() || '')
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+
+  if (!messageText) {
+    throw new Error('API 返回结果为空');
+  }
+
+  return messageText;
+}
+
+function logUsage(mode: ResolvedApiMode, data: ChatCompletionResponse | ResponsesApiResponse): void {
+  if (!data.usage) {
+    return;
+  }
+
+  if (mode === 'responses') {
+    const usage = data.usage as ResponsesApiResponse['usage'];
+    logger.info(
+      `Token 使用: input=${usage?.input_tokens ?? '-'}, output=${usage?.output_tokens ?? '-'}, total=${usage?.total_tokens ?? '-'}`
+    );
+    return;
+  }
+
+  const usage = data.usage as ChatCompletionResponse['usage'];
+  logger.info(
+    `Token 使用: prompt=${usage?.prompt_tokens ?? '-'}, completion=${usage?.completion_tokens ?? '-'}, total=${usage?.total_tokens ?? '-'}`
+  );
+}
+
+function buildHttpErrorMessage(status: number, statusText: string, apiTarget: ResolvedApiTarget): string {
+  if (status === 404) {
+    return `API 请求失败: 404 Not Found，请检查 API 地址、接口模式与模型配置是否匹配。当前端点: ${apiTarget.endpoint}`;
+  }
+
+  return `API 请求失败: ${status} ${statusText}`;
+}
+
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -294,9 +522,9 @@ async function requestWithRetry(
  */
 export async function generateCommitMessage(diff: string): Promise<string> {
   const config = getConfig();
-  const apiEndpoint = normalizeApiEndpoint(config.apiEndpoint);
-  if (apiEndpoint !== config.apiEndpoint) {
-    logger.info(`API 端点已规范化: ${config.apiEndpoint} -> ${apiEndpoint}`);
+  const apiTarget = resolveApiTarget(config.apiEndpoint, config.apiMode);
+  if (apiTarget.endpoint !== config.apiEndpoint) {
+    logger.info(`API 端点已规范化: ${config.apiEndpoint} -> ${apiTarget.endpoint}`);
   }
 
   // 检查 API Key
@@ -339,27 +567,20 @@ export async function generateCommitMessage(diff: string): Promise<string> {
     ? config.retryStatusCodes.join(', ')
     : '无';
   logger.info(
-    `准备调用 AI API: ${apiEndpoint}, 模型: ${config.model}, 重试: ${config.retryCount} 次, 超时: ${config.requestTimeoutMs}ms, 重试状态码: ${retryStatusLabel}`
+    `准备调用 AI API: ${apiTarget.endpoint}, 接口模式: ${apiTarget.mode}, 模型: ${config.model}, 重试: ${config.retryCount} 次, 超时: ${config.requestTimeoutMs}ms, 重试状态码: ${retryStatusLabel}`
   );
+  if (apiTarget.isOfficialOpenAiHost) {
+    logger.info('检测到官方 OpenAI 端点，请求将附带 store=false 以避免默认保存 diff 内容');
+  }
 
   try {
-    const response = await requestWithRetry(apiEndpoint, {
+    const response = await requestWithRetry(apiTarget.endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${config.apiKey}`
       },
-      body: JSON.stringify({
-        model: config.model,
-        messages: [
-          {
-            role: 'user',
-            content: prompt
-          }
-        ],
-        temperature: 0.7,
-        max_tokens: 500
-      })
+      body: JSON.stringify(buildRequestPayload(apiTarget, config.model, prompt))
     }, {
       retryCount: config.retryCount,
       timeoutMs: config.requestTimeoutMs,
@@ -370,7 +591,7 @@ export async function generateCommitMessage(diff: string): Promise<string> {
       const errorText = await response.text();
       logger.error(`API 请求失败: ${response.status} ${response.statusText}`);
       logger.error(`错误详情: ${errorText}`);
-      throw new Error(`API 请求失败: ${response.status} ${response.statusText}`);
+      throw new Error(buildHttpErrorMessage(response.status, response.statusText, apiTarget));
     }
 
     // 检查响应内容类型，防止代理返回 HTML 页面
@@ -383,7 +604,7 @@ export async function generateCommitMessage(diff: string): Promise<string> {
 
       if (bodyPreview.trimStart().startsWith('<') || contentType.includes('text/html')) {
         throw new Error(
-          'API 端点返回了 HTML 页面而非 JSON 数据，请检查 API 地址是否正确。当前端点: ' + apiEndpoint
+          'API 端点返回了 HTML 页面而非 JSON 数据，请检查 API 地址是否正确。当前端点: ' + apiTarget.endpoint
         );
       }
 
@@ -392,22 +613,15 @@ export async function generateCommitMessage(diff: string): Promise<string> {
       );
     }
 
-    const data = await response.json() as ChatCompletionResponse;
-
-    if (!data.choices || data.choices.length === 0) {
-      throw new Error('API 返回结果为空');
-    }
-
-    const message = data.choices[0].message.content.trim();
+    const data = await response.json() as ChatCompletionResponse | ResponsesApiResponse;
+    const message = extractGeneratedText(apiTarget.mode, data);
 
     // 清理可能的 markdown 代码块包裹
     const cleanedMessage = cleanMarkdownCodeBlock(message);
     const normalizedMessage = normalizeCommitMessage(cleanedMessage, changedFiles, resolvedTemplate);
 
     logger.info('成功生成提交消息');
-    if (data.usage) {
-      logger.info(`Token 使用: prompt=${data.usage.prompt_tokens}, completion=${data.usage.completion_tokens}`);
-    }
+    logUsage(apiTarget.mode, data);
 
     return normalizedMessage;
   } catch (error) {
@@ -421,7 +635,7 @@ export async function generateCommitMessage(diff: string): Promise<string> {
       if (error instanceof SyntaxError) {
         logger.error(`API 响应 JSON 解析失败: ${error.message}`);
         throw new Error(
-          'API 响应内容不是有效的 JSON 格式，可能是 API 代理服务异常。请检查 API 端点地址是否正确: ' + apiEndpoint
+          'API 响应内容不是有效的 JSON 格式，可能是 API 代理服务异常。请检查 API 端点地址是否正确: ' + apiTarget.endpoint
         );
       }
       throw error;

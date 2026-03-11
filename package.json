@@ -2,8 +2,9 @@
   "name": "generate-git-commit",
   "displayName": "AI Git Commit Message Generator",
   "description": "使用 AI 自动生成符合规范的 Git 提交消息",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "publisher": "shumin",
+  "icon": "icon.png",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -45,8 +46,23 @@
       "properties": {
         "generateGitCommit.apiEndpoint": {
           "type": "string",
-          "default": "https://api.openai.com/v1/chat/completions",
-          "description": "AI API 端点地址（支持 OpenAI 兼容接口，如 DeepSeek、智谱等）"
+          "default": "https://api.openai.com/v1",
+          "description": "AI API 地址，支持填写 base URL（如 /v1）或完整端点（如 /v1/chat/completions、/v1/responses）"
+        },
+        "generateGitCommit.apiMode": {
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "chat-completions",
+            "responses"
+          ],
+          "enumDescriptions": [
+            "自动判断：显式端点优先；官方 OpenAI base URL 默认走 /v1/responses，其他兼容服务默认走 /v1/chat/completions",
+            "强制使用 /v1/chat/completions 请求格式",
+            "强制使用 /v1/responses 请求格式"
+          ],
+          "description": "AI 接口模式"
         },
         "generateGitCommit.apiKey": {
           "type": "string",
@@ -102,10 +118,9 @@
             500,
             502,
             503,
-            504,
-            404
+            504
           ],
-          "description": "触发自动重试的 HTTP 状态码列表"
+          "description": "触发自动重试的 HTTP 状态码列表（默认不包含 404，避免接口地址或模式配置错误时无意义重试）"
         },
         "generateGitCommit.requestTimeoutMs": {
           "type": "number",

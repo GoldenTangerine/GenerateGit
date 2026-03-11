@@ -5,7 +5,7 @@
 ## 功能特点
 
 - 🎯 自动分析暂存区的 diff 内容
-- 🤖 支持 OpenAI 兼容的 API（OpenAI、DeepSeek、智谱等）
+- 🤖 支持 OpenAI `Chat Completions` / `Responses` 及兼容 API（OpenAI、DeepSeek、智谱等）
 - 📝 生成符合 Angular 规范的提交消息
 - 😊 自动添加对应的 emoji 前缀
 - ⚡ 一键生成，自动填入 SCM 输入框
@@ -37,7 +37,8 @@ pnpm run package
 
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
-| `apiEndpoint` | AI API 端点地址 | `https://api.openai.com/v1/chat/completions` |
+| `apiEndpoint` | AI API 地址，支持 base URL 或完整端点 | `https://api.openai.com/v1` |
+| `apiMode` | 接口模式：`auto` / `chat-completions` / `responses` | `auto` |
 | `apiKey` | AI API 密钥 | - |
 | `model` | 使用的模型名称 | `gpt-4o-mini` |
 | `customPrompt` | 自定义 Prompt | - |
@@ -45,7 +46,7 @@ pnpm run package
 | `redactPatterns` | diff 脱敏正则列表 | 预置常见模式 |
 | `maxDiffLength` | 最大 diff 长度 | `10000` |
 | `retryCount` | 自动重试次数（不包含首次请求） | `5` |
-| `retryStatusCodes` | 触发自动重试的 HTTP 状态码列表 | `408, 429, 500, 502, 503, 504, 404` |
+| `retryStatusCodes` | 触发自动重试的 HTTP 状态码列表 | `408, 429, 500, 502, 503, 504` |
 | `requestTimeoutMs` | API 请求超时时间（毫秒） | `60000` |
 
 ### 配置示例
@@ -53,7 +54,8 @@ pnpm run package
 **使用 OpenAI：**
 ```json
 {
-  "generateGitCommit.apiEndpoint": "https://api.openai.com/v1/chat/completions",
+  "generateGitCommit.apiEndpoint": "https://api.openai.com/v1",
+  "generateGitCommit.apiMode": "auto",
   "generateGitCommit.apiKey": "sk-xxx",
   "generateGitCommit.model": "gpt-4o-mini"
 }
@@ -62,9 +64,20 @@ pnpm run package
 **使用 DeepSeek：**
 ```json
 {
-  "generateGitCommit.apiEndpoint": "https://api.deepseek.com/v1/chat/completions",
+  "generateGitCommit.apiEndpoint": "https://api.deepseek.com/v1",
+  "generateGitCommit.apiMode": "auto",
   "generateGitCommit.apiKey": "sk-xxx",
   "generateGitCommit.model": "deepseek-chat"
+}
+```
+
+**强制使用 OpenAI Responses API：**
+```json
+{
+  "generateGitCommit.apiEndpoint": "https://api.openai.com/v1",
+  "generateGitCommit.apiMode": "responses",
+  "generateGitCommit.apiKey": "sk-xxx",
+  "generateGitCommit.model": "gpt-4o-mini"
 }
 ```
 
@@ -89,16 +102,22 @@ pnpm run package
 ```json
 {
   "generateGitCommit.retryCount": 5,
-  "generateGitCommit.retryStatusCodes": [408, 429, 500, 502, 503, 504, 404],
+  "generateGitCommit.retryStatusCodes": [408, 429, 500, 502, 503, 504],
   "generateGitCommit.requestTimeoutMs": 60000
 }
 ```
 `retryStatusCodes` 填 HTTP 状态码数组即可；如需关闭按状态码重试可设为 `[]`（仍会对网络/超时重试）。
 
+**接口选择规则：**
+- `apiMode = auto` 时，若 `apiEndpoint` 已明确写成 `/v1/chat/completions` 或 `/v1/responses`，插件直接按该端点发送请求。
+- `apiMode = auto` 且只填写 base URL（如 `https://api.openai.com/v1`）时，官方 OpenAI 默认走 `/v1/responses`，其他 OpenAI-compatible 服务默认走 `/v1/chat/completions`。
+- 如你的代理或兼容服务也支持 `responses`，但域名不是 `api.openai.com`，请显式设置 `apiMode = responses` 或直接把端点写成 `/v1/responses`。
+- 检测到官方 OpenAI 端点时，插件会自动附带 `store: false`，避免默认保存提交 diff 等请求内容。
+
 **重试说明：**
 - 遇到可重试状态码时会先释放响应体，再等待后重试，避免连接占用。
 - 若服务端返回 `Retry-After`，会优先遵从该等待时间（与退避时间取更大值）。
-- 连续出现 404 会提示检查 API 端点或模型名称配置。
+- 默认不重试 `404`，避免接口地址、`apiMode` 或模型配置错误时无意义等待；如确有需要，可自行把 `404` 加回 `retryStatusCodes`。
 
 ## 使用方法
 
@@ -151,12 +170,16 @@ pnpm run package
 
 ### 支持哪些 AI 服务？
 
-支持所有兼容 OpenAI Chat Completions API 的服务，包括但不限于：
+支持 OpenAI 官方的 `Responses API`、`Chat Completions API`，以及兼容 `Chat Completions` 的服务，包括但不限于：
 - OpenAI (GPT-4, GPT-3.5)
 - DeepSeek
 - 智谱 GLM
 - 通义千问
 - 月之暗面 Kimi
+
+### OpenAI 支持 `/v1/responses` 吗？
+
+支持，而且 OpenAI 官方已经把 `Responses API` 作为新项目的推荐接口；`Chat Completions` 仍可继续使用。这个插件现在两种都兼容。
 
 ## 许可证
 
