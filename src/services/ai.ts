@@ -24,6 +24,10 @@ const DEFAULT_API_ENDPOINT = 'https://api.openai.com/v1';
 const DEFAULT_MODEL = 'gpt-4o-mini';
 const DEFAULT_API_MODE: ApiMode = 'auto';
 const OPENAI_API_HOSTS = new Set(['api.openai.com']);
+const RESPONSE_BODY_READ_TIMEOUT_MS = 1200;
+const RESPONSE_BODY_MAX_CHARS = 4000;
+const RESPONSE_SUMMARY_MAX_CHARS = 240;
+const RESPONSE_PREVIEW_MAX_CHARS = 400;
 
 /**
  * AI API 响应结构
@@ -89,6 +93,13 @@ interface ResolvedApiTarget {
   endpoint: string;
   mode: ResolvedApiMode;
   isOfficialOpenAiHost: boolean;
+}
+
+interface ResponseErrorDetails {
+  summary: string;
+  preview?: string;
+  contentType?: string;
+  requestId?: string;
 }
 
 /**
@@ -430,16 +441,20 @@ function logUsage(mode: ResolvedApiMode, data: ChatCompletionResponse | Response
 
   if (mode === 'responses') {
     const usage = data.usage as ResponsesApiResponse['usage'];
-    logger.info(
-      `Token 使用: input=${usage?.input_tokens ?? '-'}, output=${usage?.output_tokens ?? '-'}, total=${usage?.total_tokens ?? '-'}`
-    );
+    logger.infoBlock('Token 使用统计', [
+      { label: 'input', value: usage?.input_tokens ?? '-' },
+      { label: 'output', value: usage?.output_tokens ?? '-' },
+      { label: 'total', value: usage?.total_tokens ?? '-' }
+    ]);
     return;
   }
 
   const usage = data.usage as ChatCompletionResponse['usage'];
-  logger.info(
-    `Token 使用: prompt=${usage?.prompt_tokens ?? '-'}, completion=${usage?.completion_tokens ?? '-'}, total=${usage?.total_tokens ?? '-'}`
-  );
+  logger.infoBlock('Token 使用统计', [
+    { label: 'prompt', value: usage?.prompt_tokens ?? '-' },
+    { label: 'completion', value: usage?.completion_tokens ?? '-' },
+    { label: 'total', value: usage?.total_tokens ?? '-' }
+  ]);
 }
 
 function buildHttpErrorMessage(status: number, statusText: string, apiTarget: ResolvedApiTarget): string {
@@ -448,6 +463,265 @@ function buildHttpErrorMessage(status: number, statusText: string, apiTarget: Re
   }
 
   return `API 请求失败: ${status} ${statusText}`;
+}
+
+async function extractResponseErrorDetails(response: Response): Promise<ResponseErrorDetails> {
+  const contentType = response.headers.get('content-type') || undefined;
+  const requestId = getResponseRequestId(response.headers);
+  const bodyText = await readResponseText(response);
+  const summary = summarizeResponseBody(bodyText, contentType);
+  const preview = buildResponsePreview(bodyText);
+
+  return {
+    summary,
+    preview: preview && preview !== summary ? preview : undefined,
+    contentType,
+    requestId
+  };
+}
+
+function getResponseRequestId(headers: Headers): string | undefined {
+  return headers.get('x-request-id')
+    || headers.get('request-id')
+    || headers.get('cf-ray')
+    || headers.get('x-amzn-requestid')
+    || undefined;
+}
+
+async function readResponseText(response: Response): Promise<string | undefined> {
+  if (!response.body) {
+    return readResponseTextFallback(response);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const chunks: string[] = [];
+  let totalChars = 0;
+  let truncated = false;
+  let timedOut = false;
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    void reader.cancel('timeout');
+  }, RESPONSE_BODY_READ_TIMEOUT_MS);
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+
+      const chunk = decoder.decode(value, { stream: true });
+      if (!chunk) {
+        continue;
+      }
+
+      const remainingChars = RESPONSE_BODY_MAX_CHARS - totalChars;
+      if (remainingChars <= 0) {
+        truncated = true;
+        break;
+      }
+
+      if (chunk.length > remainingChars) {
+        chunks.push(chunk.slice(0, remainingChars));
+        totalChars = RESPONSE_BODY_MAX_CHARS;
+        truncated = true;
+        break;
+      }
+
+      chunks.push(chunk);
+      totalChars += chunk.length;
+    }
+
+    if (!truncated && !timedOut) {
+      const tail = decoder.decode();
+      if (tail) {
+        const remainingChars = RESPONSE_BODY_MAX_CHARS - totalChars;
+        if (tail.length > remainingChars) {
+          chunks.push(tail.slice(0, Math.max(remainingChars, 0)));
+          truncated = true;
+        } else {
+          chunks.push(tail);
+        }
+      }
+    }
+  } catch {
+    // ignore and use any partial content that was already captured
+  } finally {
+    clearTimeout(timeoutId);
+    try {
+      await reader.cancel();
+    } catch {
+      // ignore
+    }
+  }
+
+  return finalizeResponseText(chunks.join(''), {
+    truncated,
+    timedOut
+  });
+}
+
+function summarizeResponseBody(bodyText: string | undefined, contentType?: string): string {
+  if (!bodyText) {
+    return '响应体为空';
+  }
+
+  const jsonMessage = extractJsonErrorMessage(bodyText);
+  if (jsonMessage) {
+    return compactText(jsonMessage, RESPONSE_SUMMARY_MAX_CHARS);
+  }
+
+  if (isHtmlResponse(bodyText, contentType)) {
+    const htmlText = stripHtmlTags(bodyText);
+    return htmlText ? `HTML 响应: ${htmlText}` : 'HTML 响应内容为空';
+  }
+
+  return compactText(bodyText, RESPONSE_SUMMARY_MAX_CHARS);
+}
+
+function buildResponsePreview(bodyText: string | undefined): string | undefined {
+  if (!bodyText) {
+    return undefined;
+  }
+
+  return compactText(bodyText, RESPONSE_PREVIEW_MAX_CHARS);
+}
+
+function extractJsonErrorMessage(text: string): string | undefined {
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    return findErrorMessage(parsed);
+  } catch {
+    return undefined;
+  }
+}
+
+function findErrorMessage(value: unknown, depth = 0): string | undefined {
+  if (depth > 4 || value === undefined || value === null) {
+    return undefined;
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed || undefined;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findErrorMessage(item, depth + 1);
+      if (found) {
+        return found;
+      }
+    }
+    return undefined;
+  }
+
+  if (typeof value !== 'object') {
+    return undefined;
+  }
+
+  const record = value as Record<string, unknown>;
+  const directKeys = ['message', 'detail', 'error_description', 'msg', 'title'];
+  for (const key of directKeys) {
+    const found = findErrorMessage(record[key], depth + 1);
+    if (found) {
+      return found;
+    }
+  }
+
+  const nestedKeys = ['error', 'details', 'response', 'cause'];
+  for (const key of nestedKeys) {
+    const found = findErrorMessage(record[key], depth + 1);
+    if (found) {
+      return found;
+    }
+  }
+
+  return undefined;
+}
+
+function isHtmlResponse(bodyText: string, contentType?: string): boolean {
+  return (contentType || '').includes('text/html') || bodyText.trimStart().startsWith('<');
+}
+
+function stripHtmlTags(text: string): string {
+  return compactText(text.replace(/<[^>]+>/g, ' '), RESPONSE_SUMMARY_MAX_CHARS);
+}
+
+function compactText(text: string, maxLength: number): string {
+  const compact = text.replace(/\s+/g, ' ').trim();
+  if (compact.length <= maxLength) {
+    return compact;
+  }
+  return `${compact.slice(0, maxLength)}...`;
+}
+
+async function readResponseTextFallback(response: Response): Promise<string | undefined> {
+  try {
+    const text = await Promise.race([
+      response.text(),
+      sleep(RESPONSE_BODY_READ_TIMEOUT_MS).then(() => '__READ_TIMEOUT__')
+    ]);
+
+    if (text === '__READ_TIMEOUT__') {
+      return '[响应体读取超时]';
+    }
+
+    return finalizeResponseText(text, {
+      truncated: text.length > RESPONSE_BODY_MAX_CHARS,
+      timedOut: false
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+function finalizeResponseText(
+  text: string,
+  options: { truncated: boolean; timedOut: boolean }
+): string | undefined {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return options.timedOut ? '[响应体读取超时]' : undefined;
+  }
+
+  let normalized = trimmed;
+  if (normalized.length > RESPONSE_BODY_MAX_CHARS) {
+    normalized = normalized.slice(0, RESPONSE_BODY_MAX_CHARS);
+    options.truncated = true;
+  }
+
+  if (options.truncated) {
+    normalized += ' ... [已截断]';
+  }
+
+  if (options.timedOut) {
+    normalized += ' ... [读取超时]';
+  }
+
+  return normalized;
+}
+
+function buildResponseLogFields(
+  response: Response,
+  details: ResponseErrorDetails,
+  extras: Array<logger.LogField | undefined> = []
+): logger.LogField[] {
+  const fields: Array<logger.LogField | undefined> = [
+    { label: '状态码', value: buildStatusLabel(response) },
+    ...extras,
+    details.requestId ? { label: '请求 ID', value: details.requestId } : undefined,
+    details.contentType ? { label: '响应类型', value: details.contentType } : undefined,
+    { label: '错误摘要', value: details.summary },
+    details.preview ? { label: '响应预览', value: details.preview } : undefined
+  ];
+
+  return fields.filter((field): field is logger.LogField => Boolean(field));
+}
+
+function buildStatusLabel(response: Response): string {
+  return response.statusText ? `${response.status} ${response.statusText}` : `${response.status}`;
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
@@ -492,9 +766,12 @@ async function requestWithRetry(
 
         const retryAfterMs = parseRetryAfterHeader(response.headers.get('retry-after'));
         const delayMs = Math.max(getRetryDelayMs(attempt), retryAfterMs ?? 0);
-        logger.warn(
-          `API 请求返回 ${response.status}，${delayMs}ms 后重试 (${attempt}/${maxAttempts - 1})`
-        );
+        const responseDetails = await extractResponseErrorDetails(response);
+        logger.warnBlock('API 请求可重试失败', buildResponseLogFields(response, responseDetails, [
+          { label: '等待重试', value: `${delayMs}ms` },
+          retryAfterMs !== null ? { label: 'Retry-After', value: `${retryAfterMs}ms` } : undefined,
+          { label: '重试进度', value: `${attempt}/${maxAttempts - 1}` }
+        ]));
         discardResponseBody(response);
         await sleep(delayMs);
         continue;
@@ -506,7 +783,12 @@ async function requestWithRetry(
       if (attempt < maxAttempts && isRetryableFetchError(error)) {
         const delayMs = getRetryDelayMs(attempt);
         const reason = isAbortError(error) ? '请求超时' : '网络异常';
-        logger.warn(`${reason}，${delayMs}ms 后重试 (${attempt}/${maxAttempts - 1})`);
+        logger.warnBlock('API 请求异常，准备重试', [
+          { label: '原因', value: reason },
+          { label: '等待重试', value: `${delayMs}ms` },
+          { label: '重试进度', value: `${attempt}/${maxAttempts - 1}` },
+          error instanceof Error ? { label: '错误信息', value: error.message } : undefined
+        ]);
         await sleep(delayMs);
         continue;
       }
@@ -566,9 +848,14 @@ export async function generateCommitMessage(diff: string): Promise<string> {
   const retryStatusLabel = config.retryStatusCodes.length > 0
     ? config.retryStatusCodes.join(', ')
     : '无';
-  logger.info(
-    `准备调用 AI API: ${apiTarget.endpoint}, 接口模式: ${apiTarget.mode}, 模型: ${config.model}, 重试: ${config.retryCount} 次, 超时: ${config.requestTimeoutMs}ms, 重试状态码: ${retryStatusLabel}`
-  );
+  logger.infoBlock('准备调用 AI API', [
+    { label: '接口地址', value: apiTarget.endpoint },
+    { label: '接口模式', value: apiTarget.mode },
+    { label: '模型', value: config.model },
+    { label: '重试次数', value: `${config.retryCount} 次` },
+    { label: '超时时间', value: `${config.requestTimeoutMs}ms` },
+    { label: '重试状态码', value: retryStatusLabel }
+  ]);
   if (apiTarget.isOfficialOpenAiHost) {
     logger.info('检测到官方 OpenAI 端点，请求将附带 store=false 以避免默认保存 diff 内容');
   }
@@ -588,9 +875,12 @@ export async function generateCommitMessage(diff: string): Promise<string> {
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      logger.error(`API 请求失败: ${response.status} ${response.statusText}`);
-      logger.error(`错误详情: ${errorText}`);
+      const responseDetails = await extractResponseErrorDetails(response);
+      logger.errorBlock('API 请求失败', buildResponseLogFields(response, responseDetails, [
+        { label: '接口地址', value: apiTarget.endpoint },
+        { label: '接口模式', value: apiTarget.mode },
+        { label: '模型', value: config.model }
+      ]));
       throw new Error(buildHttpErrorMessage(response.status, response.statusText, apiTarget));
     }
 
@@ -599,8 +889,11 @@ export async function generateCommitMessage(diff: string): Promise<string> {
     if (!contentType.includes('application/json')) {
       const bodyPreview = await response.text();
       const preview = bodyPreview.substring(0, 200);
-      logger.error(`API 响应的 Content-Type 不是 JSON: ${contentType}`);
-      logger.error(`响应内容预览: ${preview}`);
+      logger.errorBlock('API 响应格式异常', [
+        { label: '响应类型', value: contentType || '未知' },
+        { label: '接口地址', value: apiTarget.endpoint },
+        { label: '响应预览', value: compactText(preview, 200) || '响应体为空' }
+      ]);
 
       if (bodyPreview.trimStart().startsWith('<') || contentType.includes('text/html')) {
         throw new Error(
@@ -620,7 +913,10 @@ export async function generateCommitMessage(diff: string): Promise<string> {
     const cleanedMessage = cleanMarkdownCodeBlock(message);
     const normalizedMessage = normalizeCommitMessage(cleanedMessage, changedFiles, resolvedTemplate);
 
-    logger.info('成功生成提交消息');
+    logger.infoBlock('提交消息生成完成', [
+      { label: '涉及文件', value: changedFiles.length },
+      { label: '输出模板', value: resolvedTemplate === DEFAULT_OUTPUT_TEMPLATE ? '默认模板' : '自定义模板' }
+    ]);
     logUsage(apiTarget.mode, data);
 
     return normalizedMessage;
@@ -633,7 +929,10 @@ export async function generateCommitMessage(diff: string): Promise<string> {
         throw new Error('网络请求失败，请检查网络连接和 API 端点配置');
       }
       if (error instanceof SyntaxError) {
-        logger.error(`API 响应 JSON 解析失败: ${error.message}`);
+        logger.errorBlock('API 响应 JSON 解析失败', [
+          { label: '错误信息', value: error.message },
+          { label: '接口地址', value: apiTarget.endpoint }
+        ]);
         throw new Error(
           'API 响应内容不是有效的 JSON 格式，可能是 API 代理服务异常。请检查 API 端点地址是否正确: ' + apiTarget.endpoint
         );
