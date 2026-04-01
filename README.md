@@ -8,6 +8,7 @@
 - 🤖 支持 OpenAI `Chat Completions` / `Responses` 及兼容 API（OpenAI、DeepSeek、智谱等）
 - 📝 生成符合 Angular 规范的提交消息
 - 😊 自动添加对应的 emoji 前缀
+- 🗂️ 支持多仓库 / monorepo 场景，优先锁定当前点击的 Git 子库
 - ⚡ 一键生成，自动填入 SCM 输入框
 
 ## 安装
@@ -126,6 +127,7 @@ pnpm run package
 3. 点击以下任一位置的按钮：
    - 状态栏左侧的 "✨ 生成提交" 按钮
    - 源代码管理面板标题栏的 ✨ 图标
+   - 多仓库场景下，如无法自动判断目标仓库，会先弹出仓库选择框
 4. 等待 AI 生成提交消息
 5. 消息会自动填入 SCM 输入框
 

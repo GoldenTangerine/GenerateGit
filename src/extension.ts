@@ -29,7 +29,7 @@ export async function activate(context: vscode.ExtensionContext) {
   // 注册生成提交消息的命令
   const generateCommand = vscode.commands.registerCommand(
     'generate-git-commit.generate',
-    generateCommitMessageCommand
+    (...args: unknown[]) => generateCommitMessageCommand(args.length <= 1 ? args[0] : args)
   );
   context.subscriptions.push(generateCommand);
 
@@ -39,13 +39,25 @@ export async function activate(context: vscode.ExtensionContext) {
 /**
  * 生成提交消息的命令处理函数
  */
-async function generateCommitMessageCommand() {
+async function generateCommitMessageCommand(commandContext?: unknown) {
   logger.info('开始生成提交消息...');
 
+  const repository = await gitService.resolveRepository(commandContext, {
+    promptOnAmbiguous: true
+  });
+
+  if (!repository) {
+    vscode.window.showWarningMessage('未能确定当前 Git 仓库，请在目标仓库的 SCM 面板中重试');
+    logger.warn('未能确定目标仓库，取消生成');
+    return;
+  }
+
+  const repositoryLabel = gitService.getRepositoryLabel(repository);
+
   // 检查是否有暂存的变更
-  if (!gitService.hasStagedChanges()) {
-    vscode.window.showWarningMessage('没有暂存的变更，请先使用 git add 暂存文件');
-    logger.info('没有暂存的变更，取消生成');
+  if (!gitService.hasStagedChanges(repository)) {
+    vscode.window.showWarningMessage(`[${repositoryLabel}] 没有暂存的变更，请先使用 git add 暂存文件`);
+    logger.info(`仓库 ${repositoryLabel} 没有暂存的变更，取消生成`);
     return;
   }
 
@@ -54,11 +66,11 @@ async function generateCommitMessageCommand() {
 
   try {
     // 获取暂存区的 diff
-    const diff = await gitService.getStagedDiff();
+    const diff = await gitService.getStagedDiff(repository);
 
     if (!diff) {
       statusBar.setErrorState();
-      vscode.window.showWarningMessage('无法获取暂存区的变更内容');
+      vscode.window.showWarningMessage(`[${repositoryLabel}] 无法获取暂存区的变更内容`);
       return;
     }
 
@@ -66,11 +78,11 @@ async function generateCommitMessageCommand() {
     const commitMessage = await aiService.generateCommitMessage(diff);
 
     // 设置到 SCM 输入框
-    const success = gitService.setCommitMessage(commitMessage);
+    const success = gitService.setCommitMessage(repository, commitMessage);
 
     if (success) {
       statusBar.setSuccessState();
-      vscode.window.showInformationMessage('提交消息已生成');
+      vscode.window.showInformationMessage(`[${repositoryLabel}] 提交消息已生成`);
 
       // 自动聚焦到 SCM 视图
       vscode.commands.executeCommand('workbench.view.scm');
