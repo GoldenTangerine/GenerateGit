@@ -40,6 +40,7 @@ pnpm run package
 |--------|------|--------|
 | `apiEndpoint` | AI API 地址，支持 base URL 或完整端点 | `https://api.openai.com/v1` |
 | `apiMode` | 接口模式：`auto` / `chat-completions` / `responses` | `auto` |
+| `chatCompletionsDelivery` | Chat Completions 正文获取策略：`non-stream-first` / `stream-first` | `non-stream-first` |
 | `apiKey` | AI API 密钥 | - |
 | `model` | 使用的模型名称 | `gpt-4o-mini` |
 | `customPrompt` | 自定义 Prompt | - |
@@ -82,6 +83,17 @@ pnpm run package
 }
 ```
 
+**优先使用流式正文提取：**
+```json
+{
+  "generateGitCommit.apiEndpoint": "https://www.linkflow.run/v1/chat/completions",
+  "generateGitCommit.apiMode": "chat-completions",
+  "generateGitCommit.chatCompletionsDelivery": "stream-first",
+  "generateGitCommit.apiKey": "sk-xxx",
+  "generateGitCommit.model": "gpt-5.4"
+}
+```
+
 **自定义输出模板：**
 ```json
 {
@@ -114,6 +126,11 @@ pnpm run package
 - `apiMode = auto` 且只填写 base URL（如 `https://api.openai.com/v1`）时，官方 OpenAI 默认走 `/v1/responses`，其他 OpenAI-compatible 服务默认走 `/v1/chat/completions`。
 - 如你的代理或兼容服务也支持 `responses`，但域名不是 `api.openai.com`，请显式设置 `apiMode = responses` 或直接把端点写成 `/v1/responses`。
 - 检测到官方 OpenAI 端点时，插件会自动附带 `store: false`，避免默认保存提交 diff 等请求内容。
+
+**Chat Completions 正文获取策略：**
+- `chatCompletionsDelivery = non-stream-first` 时，插件会优先读取普通 JSON 响应；若服务端返回空壳 `assistant` 消息，再自动回退到 `stream: true`。
+- `chatCompletionsDelivery = stream-first` 时，插件会优先读取流式增量内容；若流式失败或未提取到正文，再自动回退到普通 JSON 响应。
+- 该配置仅影响 `chat/completions` 模式；`responses` 模式仍按标准 JSON 响应处理。
 
 **重试说明：**
 - 遇到可重试状态码时会先释放响应体，再等待后重试，避免连接占用。

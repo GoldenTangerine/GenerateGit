@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.1.5 - 2026-04-07
+
+### Added
+- 新增 `chatCompletionsDelivery` 下拉配置，可在设置中选择 `non-stream-first` 或 `stream-first`，控制 `chat/completions` 优先走非流式还是流式正文提取
+
+### Changed
+- `准备调用 AI API` 日志现在会额外展示当前的 Chat Completions 正文获取策略，便于确认扩展实际采用的请求顺序
+
+### Fixed
+- 修复只能固定先走非流式再回退流式的问题；现在可按配置优先使用流式，并在失败后自动切回非流式
+
 ## v1.1.4 - 2026-04-07
 
 ### Added

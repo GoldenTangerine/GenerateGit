@@ -12,6 +12,7 @@ import { DEFAULT_OUTPUT_TEMPLATE, renderOutputTemplate, resolveOutputTemplate } 
 
 type ApiMode = 'auto' | 'chat-completions' | 'responses';
 type ResolvedApiMode = Exclude<ApiMode, 'auto'>;
+type ChatCompletionsDelivery = 'non-stream-first' | 'stream-first';
 
 const DEFAULT_RETRY_COUNT = 5;
 const DEFAULT_REQUEST_TIMEOUT_MS = 60000;
@@ -23,11 +24,18 @@ const RETRYABLE_STATUS_HINT_THRESHOLD = 2;
 const DEFAULT_API_ENDPOINT = 'https://api.openai.com/v1';
 const DEFAULT_MODEL = 'gpt-4o-mini';
 const DEFAULT_API_MODE: ApiMode = 'auto';
+const DEFAULT_CHAT_COMPLETIONS_DELIVERY: ChatCompletionsDelivery = 'non-stream-first';
 const OPENAI_API_HOSTS = new Set(['api.openai.com']);
 const RESPONSE_BODY_READ_TIMEOUT_MS = 1200;
 const RESPONSE_BODY_MAX_CHARS = 4000;
 const RESPONSE_SUMMARY_MAX_CHARS = 240;
 const RESPONSE_PREVIEW_MAX_CHARS = 400;
+
+interface RequestWithRetryOptions {
+  retryCount: number;
+  timeoutMs: number;
+  retryStatusCodes: Set<number>;
+}
 
 /**
  * AI API 响应结构
@@ -83,6 +91,7 @@ interface GenerateCommitConfig {
   apiKey: string;
   model: string;
   apiMode: ApiMode;
+  chatCompletionsDelivery: ChatCompletionsDelivery;
   customPrompt: string;
   outputTemplate: string;
   redactPatterns: string[];
@@ -105,6 +114,11 @@ interface ResponseErrorDetails {
   requestId?: string;
 }
 
+interface ChatCompletionStreamResult {
+  text: string;
+  usage?: ChatCompletionResponse['usage'];
+}
+
 /**
  * 获取扩展配置
  */
@@ -115,6 +129,7 @@ function getConfig(): GenerateCommitConfig {
     apiKey: config.get<string>('apiKey') || '',
     model: config.get<string>('model') || DEFAULT_MODEL,
     apiMode: resolveApiMode(config.get<string>('apiMode')),
+    chatCompletionsDelivery: resolveChatCompletionsDelivery(config.get<string>('chatCompletionsDelivery')),
     customPrompt: config.get<string>('customPrompt') || '',
     outputTemplate: config.get<string>('outputTemplate') || '',
     redactPatterns: config.get<string[]>('redactPatterns') || [],
@@ -184,6 +199,20 @@ function resolveApiMode(value: string | undefined): ApiMode {
     logger.warn(`apiMode 配置无效: ${value}，已回退为 ${DEFAULT_API_MODE}`);
   }
   return DEFAULT_API_MODE;
+}
+
+function resolveChatCompletionsDelivery(value: string | undefined): ChatCompletionsDelivery {
+  if (value === 'non-stream-first' || value === 'stream-first') {
+    return value;
+  }
+  if (typeof value === 'string' && value.trim()) {
+    logger.warn(`chatCompletionsDelivery 配置无效: ${value}，已回退为 ${DEFAULT_CHAT_COMPLETIONS_DELIVERY}`);
+  }
+  return DEFAULT_CHAT_COMPLETIONS_DELIVERY;
+}
+
+function describeChatCompletionsDelivery(value: ChatCompletionsDelivery): string {
+  return value === 'stream-first' ? '优先流式，失败后回退非流式' : '优先非流式，缺正文时回退流式';
 }
 
 function detectApiModeFromPath(path: string): ResolvedApiMode | undefined {
@@ -590,12 +619,132 @@ function readStringField(value: unknown, key: string): string | undefined {
   return typeof record[key] === 'string' ? record[key] as string : undefined;
 }
 
+function createChatCompletionUsageEnvelope(
+  model: string,
+  usage?: ChatCompletionResponse['usage']
+): ChatCompletionResponse | undefined {
+  if (!usage) {
+    return undefined;
+  }
+
+  return {
+    id: 'stream-fallback',
+    object: 'chat.completion',
+    created: 0,
+    model,
+    choices: [],
+    usage
+  };
+}
+
+async function requestJsonApiData(
+  apiTarget: ResolvedApiTarget,
+  apiKey: string,
+  model: string,
+  payload: Record<string, unknown>,
+  options: RequestWithRetryOptions
+): Promise<ChatCompletionResponse | ResponsesApiResponse> {
+  const response = await requestWithRetry(apiTarget.endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`
+    },
+    body: JSON.stringify(payload)
+  }, options);
+
+  if (!response.ok) {
+    const responseDetails = await extractResponseErrorDetails(response);
+    logger.errorBlock('API 请求失败', buildResponseLogFields(response, responseDetails, [
+      { label: '接口地址', value: apiTarget.endpoint },
+      { label: '接口模式', value: apiTarget.mode },
+      { label: '模型', value: model }
+    ]));
+    throw new Error(buildHttpErrorMessage(response.status, response.statusText, apiTarget));
+  }
+
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.includes('application/json')) {
+    const bodyPreview = await response.text();
+    const preview = bodyPreview.substring(0, 200);
+    logger.errorBlock('API 响应格式异常', [
+      { label: '响应类型', value: contentType || '未知' },
+      { label: '接口地址', value: apiTarget.endpoint },
+      { label: '响应预览', value: compactText(preview, 200) || '响应体为空' }
+    ]);
+
+    if (bodyPreview.trimStart().startsWith('<') || contentType.includes('text/html')) {
+      throw new Error(
+        'API 端点返回了 HTML 页面而非 JSON 数据，请检查 API 地址是否正确。当前端点: ' + apiTarget.endpoint
+      );
+    }
+
+    throw new Error(
+      `API 端点返回了非 JSON 格式的数据 (Content-Type: ${contentType})，请检查 API 配置`
+    );
+  }
+
+  return await response.json() as ChatCompletionResponse | ResponsesApiResponse;
+}
+
+async function resolveChatCompletionsMessage(
+  apiTarget: ResolvedApiTarget,
+  config: GenerateCommitConfig,
+  requestPayload: Record<string, unknown>,
+  requestOptions: RequestWithRetryOptions
+): Promise<{ text: string; usageData?: ChatCompletionResponse | ResponsesApiResponse }> {
+  if (config.chatCompletionsDelivery === 'stream-first') {
+    try {
+      const streamResult = await requestChatCompletionTextFromStream(
+        apiTarget.endpoint,
+        config.apiKey,
+        requestPayload,
+        requestOptions
+      );
+      return {
+        text: streamResult.text,
+        usageData: createChatCompletionUsageEnvelope(config.model, streamResult.usage)
+      };
+    } catch (error) {
+      logger.warnBlock('优先流式解析失败，准备回退到非流式请求', [
+        { label: '接口地址', value: apiTarget.endpoint },
+        { label: '模型', value: config.model },
+        error instanceof Error ? { label: '错误信息', value: error.message } : undefined
+      ]);
+    }
+  }
+
+  const data = await requestJsonApiData(apiTarget, config.apiKey, config.model, requestPayload, requestOptions);
+  if (config.chatCompletionsDelivery === 'non-stream-first' && shouldRetryWithStream(apiTarget.mode, data)) {
+    logger.warnBlock('检测到非流式响应缺少正文，准备回退到流式解析', [
+      { label: '接口地址', value: apiTarget.endpoint },
+      { label: '模型', value: config.model },
+      { label: '对象类型', value: readStringField(data, 'object') || '未知' }
+    ]);
+    const streamResult = await requestChatCompletionTextFromStream(
+      apiTarget.endpoint,
+      config.apiKey,
+      requestPayload,
+      requestOptions
+    );
+    return {
+      text: streamResult.text,
+      usageData: createChatCompletionUsageEnvelope(config.model, streamResult.usage) || data
+    };
+  }
+
+  return {
+    text: extractGeneratedText(apiTarget.mode, data),
+    usageData: data
+  };
+}
+
 async function requestChatCompletionTextFromStream(
   endpoint: string,
   apiKey: string,
   payload: Record<string, unknown>,
-  options: { retryCount: number; timeoutMs: number; retryStatusCodes: Set<number> }
-): Promise<string> {
+  options: RequestWithRetryOptions
+): Promise<ChatCompletionStreamResult> {
   const response = await requestWithRetry(endpoint, {
     method: 'POST',
     headers: {
@@ -618,9 +767,9 @@ async function requestChatCompletionTextFromStream(
   }
 
   const rawStream = await response.text();
-  const streamText = extractChatCompletionStreamText(rawStream);
-  if (streamText) {
-    return streamText;
+  const streamResult = extractChatCompletionStreamText(rawStream);
+  if (streamResult.text) {
+    return streamResult;
   }
 
   logger.errorBlock('流式回退未提取到正文', [
@@ -630,8 +779,9 @@ async function requestChatCompletionTextFromStream(
   throw new Error('API 流式响应中未包含可用文本');
 }
 
-function extractChatCompletionStreamText(rawStream: string): string {
+function extractChatCompletionStreamText(rawStream: string): ChatCompletionStreamResult {
   const fragments: string[] = [];
+  let usage: ChatCompletionResponse['usage'] | undefined;
 
   rawStream.split(/\r?\n/).forEach((line) => {
     const trimmed = line.trim();
@@ -647,6 +797,10 @@ function extractChatCompletionStreamText(rawStream: string): string {
     try {
       const parsed = JSON.parse(payload) as Record<string, unknown>;
       const choices = Array.isArray(parsed.choices) ? parsed.choices as Array<Record<string, unknown>> : [];
+      const parsedUsage = parsed.usage as ChatCompletionResponse['usage'] | undefined;
+      if (parsedUsage) {
+        usage = parsedUsage;
+      }
       choices.forEach((choice) => {
         const delta = choice.delta as Record<string, unknown> | undefined;
         const deltaText = extractTextFromUnknown(delta?.content);
@@ -672,7 +826,10 @@ function extractChatCompletionStreamText(rawStream: string): string {
     }
   });
 
-  return fragments.join('').trim();
+  return {
+    text: fragments.join('').trim(),
+    usage
+  };
 }
 
 function logUsage(mode: ResolvedApiMode, data: ChatCompletionResponse | ResponsesApiResponse): void {
@@ -1093,6 +1250,9 @@ export async function generateCommitMessage(diff: string): Promise<string> {
     { label: '接口地址', value: apiTarget.endpoint },
     { label: '接口模式', value: apiTarget.mode },
     { label: '模型', value: config.model },
+    apiTarget.mode === 'chat-completions'
+      ? { label: '正文获取策略', value: describeChatCompletionsDelivery(config.chatCompletionsDelivery) }
+      : undefined,
     { label: '重试次数', value: `${config.retryCount} 次` },
     { label: '超时时间', value: `${config.requestTimeoutMs}ms` },
     { label: '重试状态码', value: retryStatusLabel }
@@ -1103,70 +1263,22 @@ export async function generateCommitMessage(diff: string): Promise<string> {
 
   try {
     const requestPayload = buildRequestPayload(apiTarget, config.model, prompt);
-    const response = await requestWithRetry(apiTarget.endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${config.apiKey}`
-      },
-      body: JSON.stringify(requestPayload)
-    }, {
+    const requestOptions: RequestWithRetryOptions = {
       retryCount: config.retryCount,
       timeoutMs: config.requestTimeoutMs,
       retryStatusCodes: new Set(config.retryStatusCodes)
-    });
+    };
 
-    if (!response.ok) {
-      const responseDetails = await extractResponseErrorDetails(response);
-      logger.errorBlock('API 请求失败', buildResponseLogFields(response, responseDetails, [
-        { label: '接口地址', value: apiTarget.endpoint },
-        { label: '接口模式', value: apiTarget.mode },
-        { label: '模型', value: config.model }
-      ]));
-      throw new Error(buildHttpErrorMessage(response.status, response.statusText, apiTarget));
-    }
-
-    // 检查响应内容类型，防止代理返回 HTML 页面
-    const contentType = response.headers.get('content-type') || '';
-    if (!contentType.includes('application/json')) {
-      const bodyPreview = await response.text();
-      const preview = bodyPreview.substring(0, 200);
-      logger.errorBlock('API 响应格式异常', [
-        { label: '响应类型', value: contentType || '未知' },
-        { label: '接口地址', value: apiTarget.endpoint },
-        { label: '响应预览', value: compactText(preview, 200) || '响应体为空' }
-      ]);
-
-      if (bodyPreview.trimStart().startsWith('<') || contentType.includes('text/html')) {
-        throw new Error(
-          'API 端点返回了 HTML 页面而非 JSON 数据，请检查 API 地址是否正确。当前端点: ' + apiTarget.endpoint
-        );
-      }
-
-      throw new Error(
-        `API 端点返回了非 JSON 格式的数据 (Content-Type: ${contentType})，请检查 API 配置`
-      );
-    }
-
-    const data = await response.json() as ChatCompletionResponse | ResponsesApiResponse;
     let message: string;
-    try {
+    let usageData: ChatCompletionResponse | ResponsesApiResponse | undefined;
+    if (apiTarget.mode === 'chat-completions') {
+      const result = await resolveChatCompletionsMessage(apiTarget, config, requestPayload, requestOptions);
+      message = result.text;
+      usageData = result.usageData;
+    } else {
+      const data = await requestJsonApiData(apiTarget, config.apiKey, config.model, requestPayload, requestOptions);
       message = extractGeneratedText(apiTarget.mode, data);
-    } catch (error) {
-      if (shouldRetryWithStream(apiTarget.mode, data)) {
-        logger.warnBlock('检测到非流式响应缺少正文，准备回退到流式解析', [
-          { label: '接口地址', value: apiTarget.endpoint },
-          { label: '模型', value: config.model },
-          { label: '对象类型', value: readStringField(data, 'object') || '未知' }
-        ]);
-        message = await requestChatCompletionTextFromStream(apiTarget.endpoint, config.apiKey, requestPayload, {
-          retryCount: config.retryCount,
-          timeoutMs: config.requestTimeoutMs,
-          retryStatusCodes: new Set(config.retryStatusCodes)
-        });
-      } else {
-        throw error;
-      }
+      usageData = data;
     }
 
     // 清理可能的 markdown 代码块包裹
@@ -1177,7 +1289,9 @@ export async function generateCommitMessage(diff: string): Promise<string> {
       { label: '涉及文件', value: changedFiles.length },
       { label: '输出模板', value: resolvedTemplate === DEFAULT_OUTPUT_TEMPLATE ? '默认模板' : '自定义模板' }
     ]);
-    logUsage(apiTarget.mode, data);
+    if (usageData) {
+      logUsage(apiTarget.mode, usageData);
+    }
 
     return normalizedMessage;
   } catch (error) {

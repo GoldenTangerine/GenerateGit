@@ -2,7 +2,7 @@
   "name": "generate-git-commit",
   "displayName": "AI Git Commit Message Generator",
   "description": "使用 AI 自动生成符合规范的 Git 提交消息",
-  "version": "1.1.4",
+  "version": "1.1.5",
   "publisher": "shumin",
   "icon": "icon.png",
   "engines": {
@@ -63,6 +63,19 @@
             "强制使用 /v1/responses 请求格式"
           ],
           "description": "AI 接口模式"
+        },
+        "generateGitCommit.chatCompletionsDelivery": {
+          "type": "string",
+          "default": "non-stream-first",
+          "enum": [
+            "non-stream-first",
+            "stream-first"
+          ],
+          "enumDescriptions": [
+            "优先使用非流式 JSON 响应；如果响应缺少正文，则自动回退到流式解析",
+            "优先使用流式响应；如果流式请求失败或未提取到正文，则自动回退到非流式 JSON 响应"
+          ],
+          "description": "Chat Completions 正文获取策略（仅在 apiMode 为 chat-completions 或自动落到该模式时生效）"
         },
         "generateGitCommit.apiKey": {
           "type": "string",
