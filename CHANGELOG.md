@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.1.4 - 2026-04-07
+
+### Added
+- 当 `chat/completions` 非流式响应仅返回 `assistant role` 而不带正文时，插件会自动回退到流式请求，并从 `delta.content` 中拼接最终文本
+
+### Fixed
+- 修复部分 OpenAI-compatible 网关对 `GPT-5` 系列仅在流式模式下返回正文，导致普通请求被误判为“API 返回结果缺少可用文本”的问题
+
 ## v1.1.3 - 2026-04-07
 
 ### Added

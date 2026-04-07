@@ -418,6 +418,26 @@ function extractGeneratedText(mode: ResolvedApiMode, data: ChatCompletionRespons
   throw new Error('API 返回结果缺少可用文本，请查看 AI Git Commit 日志中的响应摘要');
 }
 
+function shouldRetryWithStream(
+  mode: ResolvedApiMode,
+  data: ChatCompletionResponse | ResponsesApiResponse
+): data is ChatCompletionResponse {
+  if (mode !== 'chat-completions' || !('choices' in data) || !Array.isArray(data.choices) || data.choices.length === 0) {
+    return false;
+  }
+
+  const objectType = readStringField(data, 'object') || '';
+  if (!objectType.startsWith('chat.completion')) {
+    return false;
+  }
+
+  return data.choices.some((choice) => {
+    const content = extractTextFromUnknown(choice?.message?.content);
+    const directText = extractTextFromUnknown(choice?.text);
+    return !content && !directText && readStringField(choice?.message, 'role') === 'assistant';
+  });
+}
+
 function extractChatCompletionText(data: ChatCompletionResponse): string {
   if (!data.choices || data.choices.length === 0) {
     throw new Error('API 返回结果为空');
@@ -568,6 +588,91 @@ function readStringField(value: unknown, key: string): string | undefined {
 
   const record = value as Record<string, unknown>;
   return typeof record[key] === 'string' ? record[key] as string : undefined;
+}
+
+async function requestChatCompletionTextFromStream(
+  endpoint: string,
+  apiKey: string,
+  payload: Record<string, unknown>,
+  options: { retryCount: number; timeoutMs: number; retryStatusCodes: Set<number> }
+): Promise<string> {
+  const response = await requestWithRetry(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+      'Accept': 'text/event-stream'
+    },
+    body: JSON.stringify({
+      ...payload,
+      stream: true
+    })
+  }, options);
+
+  if (!response.ok) {
+    const responseDetails = await extractResponseErrorDetails(response);
+    logger.errorBlock('流式回退请求失败', buildResponseLogFields(response, responseDetails, [
+      { label: '接口地址', value: endpoint }
+    ]));
+    throw new Error(buildStatusLabel(response));
+  }
+
+  const rawStream = await response.text();
+  const streamText = extractChatCompletionStreamText(rawStream);
+  if (streamText) {
+    return streamText;
+  }
+
+  logger.errorBlock('流式回退未提取到正文', [
+    { label: '接口地址', value: endpoint },
+    { label: '响应预览', value: compactText(rawStream, RESPONSE_PREVIEW_MAX_CHARS) || '响应体为空' }
+  ]);
+  throw new Error('API 流式响应中未包含可用文本');
+}
+
+function extractChatCompletionStreamText(rawStream: string): string {
+  const fragments: string[] = [];
+
+  rawStream.split(/\r?\n/).forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) {
+      return;
+    }
+
+    const payload = trimmed.slice(5).trim();
+    if (!payload || payload === '[DONE]') {
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(payload) as Record<string, unknown>;
+      const choices = Array.isArray(parsed.choices) ? parsed.choices as Array<Record<string, unknown>> : [];
+      choices.forEach((choice) => {
+        const delta = choice.delta as Record<string, unknown> | undefined;
+        const deltaText = extractTextFromUnknown(delta?.content);
+        if (deltaText) {
+          fragments.push(deltaText);
+          return;
+        }
+
+        const message = choice.message as Record<string, unknown> | undefined;
+        const messageText = extractTextFromUnknown(message?.content);
+        if (messageText) {
+          fragments.push(messageText);
+          return;
+        }
+
+        const directText = extractTextFromUnknown(choice.text);
+        if (directText) {
+          fragments.push(directText);
+        }
+      });
+    } catch {
+      // ignore malformed stream chunks and continue collecting usable deltas
+    }
+  });
+
+  return fragments.join('').trim();
 }
 
 function logUsage(mode: ResolvedApiMode, data: ChatCompletionResponse | ResponsesApiResponse): void {
@@ -997,13 +1102,14 @@ export async function generateCommitMessage(diff: string): Promise<string> {
   }
 
   try {
+    const requestPayload = buildRequestPayload(apiTarget, config.model, prompt);
     const response = await requestWithRetry(apiTarget.endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${config.apiKey}`
       },
-      body: JSON.stringify(buildRequestPayload(apiTarget, config.model, prompt))
+      body: JSON.stringify(requestPayload)
     }, {
       retryCount: config.retryCount,
       timeoutMs: config.requestTimeoutMs,
@@ -1043,7 +1149,25 @@ export async function generateCommitMessage(diff: string): Promise<string> {
     }
 
     const data = await response.json() as ChatCompletionResponse | ResponsesApiResponse;
-    const message = extractGeneratedText(apiTarget.mode, data);
+    let message: string;
+    try {
+      message = extractGeneratedText(apiTarget.mode, data);
+    } catch (error) {
+      if (shouldRetryWithStream(apiTarget.mode, data)) {
+        logger.warnBlock('检测到非流式响应缺少正文，准备回退到流式解析', [
+          { label: '接口地址', value: apiTarget.endpoint },
+          { label: '模型', value: config.model },
+          { label: '对象类型', value: readStringField(data, 'object') || '未知' }
+        ]);
+        message = await requestChatCompletionTextFromStream(apiTarget.endpoint, config.apiKey, requestPayload, {
+          retryCount: config.retryCount,
+          timeoutMs: config.requestTimeoutMs,
+          retryStatusCodes: new Set(config.retryStatusCodes)
+        });
+      } else {
+        throw error;
+      }
+    }
 
     // 清理可能的 markdown 代码块包裹
     const cleanedMessage = cleanMarkdownCodeBlock(message);
