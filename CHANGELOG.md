@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.1.3 - 2026-04-07
+
+### Added
+- AI 响应解析失败时，日志会额外输出接口模式、响应结构摘要、`finish_reason`、`content` 类型与响应预览，便于快速判断是模式不匹配还是上游仅返回 reasoning 内容
+
+### Fixed
+- 修复部分 OpenAI-compatible 网关在 `chat/completions` 或 `responses` 模式下返回数组 / 嵌套对象内容时，被误判为“API 返回结果为空”的问题
+- 修复接口模式与实际返回体不一致时无法兼容解析的问题，现在会自动尝试回退到另一种响应结构提取文本
+
 ## v1.1.2 - 2026-04-01
 
 ### Added

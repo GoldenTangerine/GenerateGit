@@ -41,8 +41,11 @@ interface ChatCompletionResponse {
     index: number;
     message: {
       role: string;
-      content: string;
+      content: unknown;
+      reasoning_content?: string;
+      refusal?: string;
     };
+    text?: string;
     finish_reason: string;
   }[];
   usage?: {
@@ -390,10 +393,29 @@ function buildRequestPayload(target: ResolvedApiTarget, model: string, prompt: s
 }
 
 function extractGeneratedText(mode: ResolvedApiMode, data: ChatCompletionResponse | ResponsesApiResponse): string {
-  if (mode === 'responses') {
-    return extractResponsesText(data as ResponsesApiResponse);
+  const primaryExtractor = mode === 'responses'
+    ? (value: unknown) => extractResponsesText(value as ResponsesApiResponse)
+    : (value: unknown) => extractChatCompletionText(value as ChatCompletionResponse);
+  const fallbackExtractor = mode === 'responses'
+    ? (value: unknown) => extractChatCompletionText(value as ChatCompletionResponse)
+    : (value: unknown) => extractResponsesText(value as ResponsesApiResponse);
+  const primaryText = tryExtractText(primaryExtractor, data);
+  if (primaryText) {
+    return primaryText;
   }
-  return extractChatCompletionText(data as ChatCompletionResponse);
+
+  const fallbackText = tryExtractText(fallbackExtractor, data);
+  if (fallbackText) {
+    logger.warnBlock('API 响应格式与当前模式不一致，已自动回退解析', [
+      { label: '当前模式', value: mode },
+      { label: '回退模式', value: mode === 'responses' ? 'chat-completions' : 'responses' },
+      { label: '对象类型', value: readStringField(data, 'object') || '未知' }
+    ]);
+    return fallbackText;
+  }
+
+  logger.errorBlock('API 响应缺少可用文本内容', buildExtractionFailureFields(mode, data));
+  throw new Error('API 返回结果缺少可用文本，请查看 AI Git Commit 日志中的响应摘要');
 }
 
 function extractChatCompletionText(data: ChatCompletionResponse): string {
@@ -401,12 +423,19 @@ function extractChatCompletionText(data: ChatCompletionResponse): string {
     throw new Error('API 返回结果为空');
   }
 
-  const message = data.choices[0].message.content?.trim();
-  if (!message) {
-    throw new Error('API 返回结果为空');
+  for (const choice of data.choices) {
+    const message = extractTextFromUnknown(choice?.message?.content);
+    if (message) {
+      return message;
+    }
+
+    const directText = extractTextFromUnknown(choice?.text);
+    if (directText) {
+      return directText;
+    }
   }
 
-  return message;
+  throw new Error('API 返回结果为空');
 }
 
 function extractResponsesText(data: ResponsesApiResponse): string {
@@ -419,10 +448,8 @@ function extractResponsesText(data: ResponsesApiResponse): string {
   }
 
   const messageText = data.output
-    .filter((item) => item.type === 'message' && Array.isArray(item.content))
-    .flatMap((item) => item.content ?? [])
-    .filter((item) => item.type === 'output_text' && typeof item.text === 'string')
-    .map((item) => item.text?.trim() || '')
+    .filter((item) => item.type === 'message')
+    .map((item) => extractTextFromUnknown(item.content))
     .filter(Boolean)
     .join('\n')
     .trim();
@@ -432,6 +459,115 @@ function extractResponsesText(data: ResponsesApiResponse): string {
   }
 
   return messageText;
+}
+
+function tryExtractText(
+  extractor: (data: unknown) => string,
+  data: unknown
+): string | undefined {
+  try {
+    const text = extractor(data);
+    return text.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function extractTextFromUnknown(value: unknown, depth = 0): string {
+  if (depth > 4 || value === undefined || value === null) {
+    return '';
+  }
+
+  if (typeof value === 'string') {
+    return value.trim();
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => extractTextFromUnknown(item, depth + 1))
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+  }
+
+  if (typeof value !== 'object') {
+    return '';
+  }
+
+  const record = value as Record<string, unknown>;
+  const candidateKeys = ['text', 'value', 'content'];
+  const fragments = candidateKeys
+    .map((key) => extractTextFromUnknown(record[key], depth + 1))
+    .filter(Boolean);
+
+  if (fragments.length > 0) {
+    return fragments.join('\n').trim();
+  }
+
+  return '';
+}
+
+function buildExtractionFailureFields(
+  mode: ResolvedApiMode,
+  data: ChatCompletionResponse | ResponsesApiResponse
+): logger.LogField[] {
+  const fields: Array<logger.LogField | undefined> = [
+    { label: '接口模式', value: mode },
+    { label: '对象类型', value: readStringField(data, 'object') || '未知' },
+    { label: '模型', value: readStringField(data, 'model') || '未知' }
+  ];
+
+  if ('choices' in data) {
+    const firstChoice = data.choices?.[0];
+    const message = firstChoice?.message as Record<string, unknown> | undefined;
+    fields.push(
+      { label: 'choices 数量', value: Array.isArray(data.choices) ? data.choices.length : 0 },
+      { label: 'finish_reason', value: readStringField(firstChoice, 'finish_reason') || '未知' },
+      { label: 'content 类型', value: describeValueShape(message?.content) },
+      message && typeof message.reasoning_content === 'string' && message.reasoning_content.trim()
+        ? { label: 'reasoning 摘要', value: compactText(message.reasoning_content, RESPONSE_SUMMARY_MAX_CHARS) }
+        : undefined,
+      message && typeof message.refusal === 'string' && message.refusal.trim()
+        ? { label: 'refusal', value: compactText(message.refusal, RESPONSE_SUMMARY_MAX_CHARS) }
+        : undefined,
+      { label: '响应预览', value: buildSuccessfulResponsePreview(data) }
+    );
+  } else {
+    fields.push(
+      { label: 'output 数量', value: Array.isArray(data.output) ? data.output.length : 0 },
+      { label: 'output_text 类型', value: describeValueShape(data.output_text) },
+      { label: '响应预览', value: buildSuccessfulResponsePreview(data) }
+    );
+  }
+
+  return fields.filter((field): field is logger.LogField => Boolean(field));
+}
+
+function buildSuccessfulResponsePreview(data: ChatCompletionResponse | ResponsesApiResponse): string {
+  try {
+    return compactText(JSON.stringify(data), RESPONSE_PREVIEW_MAX_CHARS);
+  } catch {
+    return '[响应对象无法序列化]';
+  }
+}
+
+function describeValueShape(value: unknown): string {
+  if (value === null) {
+    return 'null';
+  }
+  if (Array.isArray(value)) {
+    return `array(${value.length})`;
+  }
+  return typeof value;
+}
+
+function readStringField(value: unknown, key: string): string | undefined {
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+
+  const record = value as Record<string, unknown>;
+  return typeof record[key] === 'string' ? record[key] as string : undefined;
 }
 
 function logUsage(mode: ResolvedApiMode, data: ChatCompletionResponse | ResponsesApiResponse): void {
