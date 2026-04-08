@@ -803,22 +803,20 @@ function extractChatCompletionStreamText(rawStream: string): ChatCompletionStrea
       }
       choices.forEach((choice) => {
         const delta = choice.delta as Record<string, unknown> | undefined;
-        const deltaText = extractTextFromUnknown(delta?.content);
-        if (deltaText) {
-          fragments.push(deltaText);
+        // 流式 delta 需直接取字符串，不做 trim，否则单独的 "\n" chunk 会被清除
+        if (typeof delta?.content === 'string') {
+          fragments.push(delta.content);
           return;
         }
 
         const message = choice.message as Record<string, unknown> | undefined;
-        const messageText = extractTextFromUnknown(message?.content);
-        if (messageText) {
-          fragments.push(messageText);
+        if (typeof message?.content === 'string') {
+          fragments.push(message.content);
           return;
         }
 
-        const directText = extractTextFromUnknown(choice.text);
-        if (directText) {
-          fragments.push(directText);
+        if (typeof choice.text === 'string') {
+          fragments.push(choice.text);
         }
       });
     } catch {
