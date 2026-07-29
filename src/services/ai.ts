@@ -5,14 +5,27 @@
 
 import * as vscode from 'vscode';
 import * as logger from '../utils/logger';
-import { buildMergePrompt, buildPrompt } from '../utils/prompt';
+import {
+  buildMergePrompt,
+  buildPrompt,
+  DEFAULT_DESCRIPTION_LENGTH_RANGE,
+  DEFAULT_TITLE_LENGTH_RANGE,
+  DESCRIPTION_LENGTH_RANGES,
+  DescriptionLengthRange,
+  TITLE_LENGTH_RANGES,
+  TitleLengthRange
+} from '../utils/prompt';
 import { extractChangedFilePaths } from '../utils/diff';
 import { DEFAULT_REDACT_PATTERNS, redactSensitiveText } from '../utils/redact';
 import { DEFAULT_OUTPUT_TEMPLATE, renderOutputTemplate, resolveOutputTemplate } from '../utils/outputTemplate';
+import { buildRequestPayload } from '../utils/requestPayload';
 import {
+  buildChangeLines,
   createLengthLimitedBatches,
+  extractCommitTitle,
   mapWithConcurrency,
   mergeCommitMessagesLocally,
+  parseFileChanges,
   splitDiffIntoChunks
 } from '../utils/largeDiff';
 
@@ -38,6 +51,7 @@ const DEFAULT_DIFF_MERGE_MODE: DiffMergeMode = 'local';
 const DEFAULT_DIFF_CONCURRENCY = 1;
 const MAX_DIFF_CONCURRENCY = 10;
 const DEFAULT_MERGE_RETRY_COUNT = 5;
+const DEFAULT_MAX_OUTPUT_TOKENS = 10000;
 const MAX_MERGE_ROUNDS = 20;
 const OPENAI_API_HOSTS = new Set(['api.openai.com']);
 const RESPONSE_BODY_READ_TIMEOUT_MS = 1200;
@@ -108,6 +122,9 @@ interface GenerateCommitConfig {
   chatCompletionsDelivery: ChatCompletionsDelivery;
   customPrompt: string;
   outputTemplate: string;
+  titleLengthRange: TitleLengthRange;
+  descriptionLengthRange: DescriptionLengthRange;
+  maxOutputTokens: number;
   redactPatterns: string[];
   maxDiffLength: number;
   diffMergeMode: DiffMergeMode;
@@ -151,6 +168,9 @@ function getConfig(): GenerateCommitConfig {
     chatCompletionsDelivery: resolveChatCompletionsDelivery(config.get<string>('chatCompletionsDelivery')),
     customPrompt: config.get<string>('customPrompt') || '',
     outputTemplate: config.get<string>('outputTemplate') || '',
+    titleLengthRange: resolveTitleLengthRange(config.get<string>('titleLengthRange')),
+    descriptionLengthRange: resolveDescriptionLengthRange(config.get<string>('descriptionLengthRange')),
+    maxOutputTokens: resolveMaxOutputTokens(config.get<number>('maxOutputTokens')),
     redactPatterns: config.get<string[]>('redactPatterns') || [],
     maxDiffLength: resolveMaxDiffLength(config.get<number>('maxDiffLength')),
     diffMergeMode: resolveDiffMergeMode(config.get<string>('diffMergeMode')),
@@ -309,6 +329,33 @@ function resolveMaxDiffLength(value: number | undefined): number {
   return normalized;
 }
 
+function resolveTitleLengthRange(value: string | undefined): TitleLengthRange {
+  if (value && (TITLE_LENGTH_RANGES as readonly string[]).includes(value)) {
+    return value as TitleLengthRange;
+  }
+  if (typeof value === 'string' && value.trim()) {
+    logger.warn(`titleLengthRange 配置无效: ${value}，已回退为 ${DEFAULT_TITLE_LENGTH_RANGE}`);
+  }
+  return DEFAULT_TITLE_LENGTH_RANGE;
+}
+
+function resolveDescriptionLengthRange(value: string | undefined): DescriptionLengthRange {
+  if (value && (DESCRIPTION_LENGTH_RANGES as readonly string[]).includes(value)) {
+    return value as DescriptionLengthRange;
+  }
+  if (typeof value === 'string' && value.trim()) {
+    logger.warn(`descriptionLengthRange 配置无效: ${value}，已回退为 ${DEFAULT_DESCRIPTION_LENGTH_RANGE}`);
+  }
+  return DEFAULT_DESCRIPTION_LENGTH_RANGE;
+}
+
+function resolveMaxOutputTokens(value: number | undefined): number {
+  if (typeof value !== 'number' || Number.isNaN(value) || value < 1) {
+    return DEFAULT_MAX_OUTPUT_TOKENS;
+  }
+  return Math.floor(value);
+}
+
 function resolveDiffMergeMode(value: string | undefined): DiffMergeMode {
   if (value === 'local' || value === 'remote') {
     return value;
@@ -423,38 +470,6 @@ function parseRetryAfterHeader(value: string | null): number | null {
   }
 
   return null;
-}
-
-function buildRequestPayload(target: ResolvedApiTarget, model: string, prompt: string): Record<string, unknown> {
-  const openAiStorePayload = target.isOfficialOpenAiHost ? { store: false } : {};
-
-  if (target.mode === 'responses') {
-    return {
-      model,
-      input: [
-        {
-          role: 'user',
-          content: prompt
-        }
-      ],
-      temperature: 0.7,
-      max_output_tokens: 500,
-      ...openAiStorePayload
-    };
-  }
-
-  return {
-    model,
-    messages: [
-      {
-        role: 'user',
-        content: prompt
-      }
-    ],
-    temperature: 0.7,
-    max_tokens: 500,
-    ...openAiStorePayload
-  };
 }
 
 function extractGeneratedText(mode: ResolvedApiMode, data: ChatCompletionResponse | ResponsesApiResponse): string {
@@ -1277,6 +1292,10 @@ export async function generateCommitMessage(diff: string): Promise<string> {
     { label: '接口地址', value: apiTarget.endpoint },
     { label: '接口模式', value: apiTarget.mode },
     { label: '模型', value: config.model },
+    config.customPrompt
+      ? { label: 'Prompt 规则', value: '自定义 Prompt 优先' }
+      : { label: '标题/描述长度', value: `${config.titleLengthRange} / ${config.descriptionLengthRange}` },
+    { label: '最大输出 Token', value: config.maxOutputTokens },
     { label: 'Diff 分段', value: `${diffChunks.length} 段` },
     { label: '归并方式', value: config.diffMergeMode === 'remote' ? '远程' : '本地' },
     { label: '并发数', value: config.diffConcurrency },
@@ -1309,7 +1328,9 @@ export async function generateCommitMessage(diff: string): Promise<string> {
         const prompt = buildPrompt(chunk, {
           customPrompt: config.customPrompt || undefined,
           fileList: chunkFiles,
-          outputTemplate: resolvedTemplate
+          outputTemplate: resolvedTemplate,
+          titleLengthRange: config.titleLengthRange,
+          descriptionLengthRange: config.descriptionLengthRange
         });
         logger.info(
           `正在分析 Diff 分段 ${index + 1}/${diffChunks.length}，Diff：${chunk.length} 字符，Prompt：${prompt.length} 字符`
@@ -1377,7 +1398,7 @@ async function requestAiMessage(
   prompt: string,
   requestOptions: RequestWithRetryOptions
 ): Promise<{ text: string; usageData?: ChatCompletionResponse | ResponsesApiResponse }> {
-  const requestPayload = buildRequestPayload(apiTarget, model, prompt);
+  const requestPayload = buildRequestPayload(apiTarget, model, prompt, config.maxOutputTokens);
   if (apiTarget.mode === 'chat-completions') {
     return resolveChatCompletionsMessage(
       apiTarget,
@@ -1424,7 +1445,9 @@ async function mergeCommitMessagesRemotely(
         const prompt = buildMergePrompt(batch, {
           mergePrompt: config.mergePrompt || undefined,
           fileList: batchFiles,
-          outputTemplate: template
+          outputTemplate: template,
+          titleLengthRange: config.titleLengthRange,
+          descriptionLengthRange: config.descriptionLengthRange
         });
         logger.info(`远程归并 Prompt 长度：${prompt.length} 字符`);
         const result = await requestAiMessage(apiTarget, config, mergeModel, prompt, requestOptions);
@@ -1456,10 +1479,7 @@ function findReferencedFiles(messages: string[], files: string[]): string[] {
 function renderLocalMergedMessage(messages: string[], files: string[], template: string): string {
   const merged = mergeCommitMessagesLocally(messages, files);
   const title = merged.title || '🐳 chore: 更新提交信息';
-  const changeLines = files.map((file) => {
-    const description = merged.descriptions.get(file) || buildFallbackDescription(file);
-    return `- ${file}：${description}`;
-  });
+  const changeLines = buildChangeLines(files, merged.changes);
   return renderOutputTemplate(template, title, changeLines, files);
 }
 
@@ -1484,90 +1504,13 @@ function cleanMarkdownCodeBlock(text: string): string {
  */
 function normalizeCommitMessage(message: string, files: string[], template: string): string {
   const trimmed = message.trim();
-  const title = extractTitle(trimmed) || '🐳 chore: 更新提交信息';
+  const title = extractCommitTitle(trimmed) || '🐳 chore: 更新提交信息';
 
   if (files.length === 0) {
     return title;
   }
 
-  const descriptionMap = extractFileDescriptions(trimmed, files);
-  const changeLines = files.map((file) => {
-    const description = descriptionMap.get(file) || buildFallbackDescription(file);
-    return `- ${file}：${description}`;
-  });
+  const changeLines = buildChangeLines(files, parseFileChanges(trimmed, files));
 
   return renderOutputTemplate(template, title, changeLines, files);
-}
-
-function extractTitle(message: string): string | undefined {
-  const lines = message.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  if (lines.length === 0) {
-    return undefined;
-  }
-
-  const candidate = lines[0];
-  if (candidate.startsWith('-') || candidate === '修改内容：' || candidate === '涉及组件：') {
-    return undefined;
-  }
-
-  return candidate;
-}
-
-function extractFileDescriptions(message: string, files: string[]): Map<string, string> {
-  const fileSet = new Set(files);
-  const descriptions = new Map<string, string>();
-  const lines = message.split(/\r?\n/);
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith('-')) {
-      continue;
-    }
-
-    const match = trimmed.match(/^-+\s*(.+?)\s*[:：]\s*(.+)$/);
-    if (!match) {
-      continue;
-    }
-
-    const pathToken = normalizePathToken(match[1]);
-    const description = match[2].trim();
-    if (!description) {
-      continue;
-    }
-
-    if (fileSet.has(pathToken) && !descriptions.has(pathToken)) {
-      descriptions.set(pathToken, description);
-    }
-  }
-
-  return descriptions;
-}
-
-function normalizePathToken(value: string): string {
-  let normalized = value.trim();
-  if (normalized.startsWith('./')) {
-    normalized = normalized.slice(2);
-  }
-  if (normalized.startsWith('a/')) {
-    normalized = normalized.slice(2);
-  } else if (normalized.startsWith('b/')) {
-    normalized = normalized.slice(2);
-  }
-
-  return normalized;
-}
-
-function buildFallbackDescription(file: string): string {
-  const name = file.split('/').pop() || file;
-  if (name.endsWith('.vue')) {
-    return `调整 ${name.replace('.vue', '')} 组件逻辑`;
-  }
-  if (name.endsWith('.ts')) {
-    return `优化 ${name.replace('.ts', '')} 相关实现`;
-  }
-  if (name.endsWith('.js')) {
-    return `更新 ${name.replace('.js', '')} 相关逻辑`;
-  }
-
-  return `更新 ${name} 相关逻辑`;
 }

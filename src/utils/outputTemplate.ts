@@ -5,7 +5,7 @@
 
 export const DEFAULT_OUTPUT_TEMPLATE = `{title}
 
-修改内容：
+变更内容：
 {changes}
 
 涉及组件：
@@ -28,7 +28,9 @@ export function resolveOutputTemplate(template?: string): string {
 }
 
 export function buildOutputTemplatePreview(template: string, files: string[]): string {
-  const changeLines = files.map((file) => `- ${file}：<一句话描述>`).join('\n');
+  const changeLines = files
+    .map((file) => `- [<变更类型>] ${file}：<变更描述>`)
+    .join('\n');
   const fileLines = files.map((file) => `- ${file}`).join('\n');
 
   return template

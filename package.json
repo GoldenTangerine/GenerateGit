@@ -2,7 +2,7 @@
   "name": "generate-git-commit",
   "displayName": "AI Git Commit Message Generator",
   "description": "使用 AI 自动生成符合规范的 Git 提交消息",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "publisher": "shumin",
   "icon": "icon.png",
   "engines": {
@@ -85,17 +85,55 @@
         "generateGitCommit.model": {
           "type": "string",
           "default": "gpt-4o-mini",
-          "description": "Diff 分析模型名称；模型上下文需容纳 Prompt、文件清单、分段内容及最多 500 个输出 token"
+          "description": "Diff 分析模型名称；模型上下文需容纳 Prompt、文件清单、分段内容和最大输出 token"
         },
         "generateGitCommit.customPrompt": {
           "type": "string",
           "default": "",
-          "description": "自定义 Diff 分析 Prompt；留空使用内置 Prompt（当前 1920 个 JavaScript 字符）"
+          "description": "自定义 Diff 分析 Prompt；留空使用内置 Prompt，填写后不应用标题和描述长度档位"
         },
         "generateGitCommit.outputTemplate": {
           "type": "string",
-          "default": "{title}\n\n修改内容：\n{changes}\n\n涉及组件：\n{files}",
+          "default": "{title}\n\n变更内容：\n{changes}\n\n涉及组件：\n{files}",
           "description": "输出模板，支持占位符 {title}、{changes}、{files}；模板预览和文件清单会计入模型输入长度"
+        },
+        "generateGitCommit.titleLengthRange": {
+          "type": "string",
+          "default": "20-35",
+          "enum": [
+            "10-20",
+            "20-35",
+            "35-50"
+          ],
+          "enumDescriptions": [
+            "精简标题，主题控制在 10-20 个字符",
+            "标准标题，主题控制在 20-35 个字符",
+            "详细标题，主题控制在 35-50 个字符"
+          ],
+          "description": "内置 Prompt 的标题长度目标，不计算 emoji、type 和 scope"
+        },
+        "generateGitCommit.descriptionLengthRange": {
+          "type": "string",
+          "default": "20-50",
+          "enum": [
+            "10-25",
+            "20-50",
+            "40-80",
+            "80-130"
+          ],
+          "enumDescriptions": [
+            "精简描述，每条控制在 10-25 个字符",
+            "标准描述，每条控制在 20-50 个字符",
+            "详细描述，每条控制在 40-80 个字符",
+            "完整描述，每条控制在 80-130 个字符"
+          ],
+          "description": "内置 Prompt 的单条变更描述长度目标，不计算分类标签和文件路径"
+        },
+        "generateGitCommit.maxOutputTokens": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 1,
+          "description": "单次分析和远程归并请求允许模型生成的最大 token 数；需确保模型和服务商支持该值"
         },
         "generateGitCommit.redactPatterns": {
           "type": "array",
@@ -114,7 +152,7 @@
           "type": "number",
           "default": 10000,
           "minimum": 1000,
-          "description": "单段 diff 上限（JavaScript UTF-16 字符）；内置分析 Prompt 空输入固定占 1972 字符，另需加文件清单、模板并预留最多 500 个输出 token；字符数不等于模型 token 数"
+          "description": "单段 diff 上限（JavaScript UTF-16 字符）；实际输入还包含 Prompt、文件清单和模板，并需为最大输出 token 预留上下文；字符数不等于模型 token 数"
         },
         "generateGitCommit.diffMergeMode": {
           "type": "string",
@@ -139,7 +177,7 @@
         "generateGitCommit.mergeModel": {
           "type": "string",
           "default": "",
-          "description": "远程归并模型名称（留空继承 model）；其上下文需容纳分段结果、归并 Prompt、文件清单、模板及最多 500 个输出 token"
+          "description": "远程归并模型名称（留空继承 model）；其上下文需容纳分段结果、归并 Prompt、文件清单、模板和最大输出 token"
         },
         "generateGitCommit.mergeRetryCount": {
           "type": "number",
@@ -150,7 +188,7 @@
         "generateGitCommit.mergePrompt": {
           "type": "string",
           "default": "",
-          "description": "自定义远程归并 Prompt；留空使用内置 Prompt（当前 192 个 JavaScript 字符，空归并包装固定占 294 字符）"
+          "description": "自定义远程归并 Prompt；留空使用内置 Prompt，填写后不应用标题和描述长度档位"
         },
         "generateGitCommit.retryCount": {
           "type": "number",

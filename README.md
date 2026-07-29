@@ -45,6 +45,9 @@ pnpm run package
 | `model` | 使用的模型名称 | `gpt-4o-mini` |
 | `customPrompt` | 自定义 Diff 分析 Prompt | - |
 | `outputTemplate` | 输出模板（支持 `{title}`、`{changes}`、`{files}`） | - |
+| `titleLengthRange` | 标题长度目标：`10-20` / `20-35` / `35-50` | `20-35` |
+| `descriptionLengthRange` | 单条描述长度目标：`10-25` / `20-50` / `40-80` / `80-130` | `20-50` |
+| `maxOutputTokens` | 单次请求最大输出 token 数 | `10000` |
 | `redactPatterns` | diff 脱敏正则列表 | 预置常见模式 |
 | `maxDiffLength` | 单次分析的最大 diff 长度，超出后自动分段 | `10000` |
 | `diffMergeMode` | 分段结果归并方式：`local` / `remote` | `local` |
@@ -58,12 +61,13 @@ pnpm run package
 
 ### 模型长度计算
 
-- 内置 Diff 分析 Prompt 为 `1920` 个 JavaScript 字符；空输入固定包装后为 `1972` 个字符。
-- 内置远程归并 Prompt 为 `192` 个 JavaScript 字符；空归并包装后为 `294` 个字符。
+- 内置分析和归并 Prompt 的长度会随标题、描述档位以及文件数量变化。
 - 实际输入还包含文件清单、展开后的输出模板、Diff 分段或待归并结果；日志会记录每次请求的实际 Prompt 字符长度。
 - `maxDiffLength` 使用 JavaScript UTF-16 长度计算，中文通常占 1，emoji 等字符可能占 2；该字符数不等于模型 token 数。
-- 请求最多预留 `500` 个输出 token。应确保“实际输入 token + 500”不超过所选模型上下文窗口，并以模型服务商的 tokenizer 结果为准。
+- 请求默认允许最多 `10000` 个输出 token。应确保“实际输入 token + maxOutputTokens”不超过所选模型上下文窗口，并以模型服务商的 tokenizer 结果为准。
+- 部分模型或兼容服务不支持 `10000`，遇到参数错误时请调低 `maxOutputTokens`。
 - 使用 `customPrompt`、`mergePrompt` 或较长 `outputTemplate` 时，需要相应降低 `maxDiffLength`。
+- 填写 `customPrompt` 或 `mergePrompt` 后，自定义 Prompt 优先，不再应用标题和描述长度档位。
 
 ### 配置示例
 
@@ -111,7 +115,16 @@ pnpm run package
 **自定义输出模板：**
 ```json
 {
-  "generateGitCommit.outputTemplate": "{title}\n\n修改内容：\n{changes}\n\n涉及组件：\n{files}"
+  "generateGitCommit.outputTemplate": "{title}\n\n变更内容：\n{changes}\n\n涉及组件：\n{files}"
+}
+```
+
+**配置生成详细度：**
+```json
+{
+  "generateGitCommit.titleLengthRange": "20-35",
+  "generateGitCommit.descriptionLengthRange": "20-50",
+  "generateGitCommit.maxOutputTokens": 10000
 }
 ```
 
@@ -186,8 +199,16 @@ pnpm run package
 ```
 <emoji> <type>(<scope>): <主题>
 
-<正文>
+变更内容：
+- [新增] <文件路径>：<变更描述>
+- [修改] <文件路径>：<变更描述>
+
+涉及组件：
+- <文件路径>
 ```
+
+- 变更类型固定为 `[新增]`、`[修改]`、`[删除]`、`[重命名]`。
+- 同一文件包含多类变更时会输出多行；缺失或未知标签显示为 `[未分类]`。
 
 ### Emoji 与 Type 对照表
 

@@ -9,10 +9,19 @@
  */
 
 const DIFF_HEADER = 'diff --git ';
+const CHANGE_TYPES = new Set<ChangeType>(['新增', '修改', '删除', '重命名']);
+
+export type ChangeType = '新增' | '修改' | '删除' | '重命名' | '未分类';
+
+export interface FileChange {
+  file: string;
+  type: ChangeType;
+  description: string;
+}
 
 export interface LocalCommitMergeResult {
   title: string;
-  descriptions: Map<string, string>;
+  changes: FileChange[];
 }
 
 /**
@@ -118,27 +127,70 @@ export async function mapWithConcurrency<T, R>(
  */
 export function mergeCommitMessagesLocally(messages: string[], files: string[]): LocalCommitMergeResult {
   const titles = messages
-    .map(extractTitle)
+    .map(extractCommitTitle)
     .filter((title): title is string => Boolean(title));
-  const descriptionLists = new Map<string, string[]>();
+  const changes: FileChange[] = [];
+  const seen = new Set<string>();
 
   for (const message of messages) {
-    const descriptions = extractFileDescriptions(message, files);
-    for (const [file, description] of descriptions) {
-      const values = descriptionLists.get(file) || [];
-      if (!values.includes(description)) {
-        values.push(description);
+    for (const change of parseFileChanges(message, files)) {
+      const key = `${change.file}\0${change.type}\0${change.description}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        changes.push(change);
       }
-      descriptionLists.set(file, values);
     }
   }
 
   return {
     title: titles.join('；'),
-    descriptions: new Map(
-      Array.from(descriptionLists, ([file, descriptions]) => [file, descriptions.join('；')])
-    )
+    changes
   };
+}
+
+export function parseFileChanges(message: string, files: string[]): FileChange[] {
+  const fileSet = new Set(files);
+  const changes: FileChange[] = [];
+  const seen = new Set<string>();
+
+  for (const line of message.split(/\r?\n/)) {
+    const match = line.trim().match(/^-+\s*(?:\[([^\]]+)\]\s*)?(.+?)\s*[:：]\s*(.+)$/);
+    if (!match) {
+      continue;
+    }
+
+    const file = normalizePathToken(match[2]);
+    const description = match[3].trim();
+    if (!fileSet.has(file) || !description) {
+      continue;
+    }
+
+    const type = normalizeChangeType(match[1]);
+    const key = `${file}\0${type}\0${description}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      changes.push({ file, type, description });
+    }
+  }
+
+  return changes;
+}
+
+export function buildChangeLines(files: string[], changes: FileChange[]): string[] {
+  const changesByFile = new Map<string, FileChange[]>();
+  for (const change of changes) {
+    const values = changesByFile.get(change.file) || [];
+    values.push(change);
+    changesByFile.set(change.file, values);
+  }
+
+  return files.flatMap((file) => {
+    const values = changesByFile.get(file);
+    if (!values || values.length === 0) {
+      return [`- [未分类] ${file}：${buildFallbackDescription(file)}`];
+    }
+    return values.map((change) => `- [${change.type}] ${file}：${change.description}`);
+  });
 }
 
 function splitDiffFileBlocks(diff: string): string[] {
@@ -207,37 +259,27 @@ function findLineBoundary(text: string, offset: number, length: number): number 
   return lineEnd >= offset ? lineEnd + 1 : hardEnd;
 }
 
-function extractTitle(message: string): string | undefined {
+export function extractCommitTitle(message: string): string | undefined {
   const lines = message.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   if (lines.length === 0) {
     return undefined;
   }
 
   const candidate = lines[0];
-  if (candidate.startsWith('-') || candidate === '修改内容：' || candidate === '涉及组件：') {
+  if (
+    candidate.startsWith('-')
+    || candidate === '修改内容：'
+    || candidate === '变更内容：'
+    || candidate === '涉及组件：'
+  ) {
     return undefined;
   }
   return candidate;
 }
 
-function extractFileDescriptions(message: string, files: string[]): Map<string, string> {
-  const fileSet = new Set(files);
-  const descriptions = new Map<string, string>();
-
-  for (const line of message.split(/\r?\n/)) {
-    const match = line.trim().match(/^-+\s*(.+?)\s*[:：]\s*(.+)$/);
-    if (!match) {
-      continue;
-    }
-
-    const path = normalizePathToken(match[1]);
-    const description = match[2].trim();
-    if (fileSet.has(path) && description && !descriptions.has(path)) {
-      descriptions.set(path, description);
-    }
-  }
-
-  return descriptions;
+function normalizeChangeType(value: string | undefined): ChangeType {
+  const normalized = value?.trim() as ChangeType | undefined;
+  return normalized && CHANGE_TYPES.has(normalized) ? normalized : '未分类';
 }
 
 function normalizePathToken(value: string): string {
@@ -249,4 +291,19 @@ function normalizePathToken(value: string): string {
     normalized = normalized.slice(2);
   }
   return normalized;
+}
+
+function buildFallbackDescription(file: string): string {
+  const name = file.split('/').pop() || file;
+  if (name.endsWith('.vue')) {
+    return `调整 ${name.replace('.vue', '')} 组件逻辑`;
+  }
+  if (name.endsWith('.ts')) {
+    return `优化 ${name.replace('.ts', '')} 相关实现`;
+  }
+  if (name.endsWith('.js')) {
+    return `更新 ${name.replace('.js', '')} 相关逻辑`;
+  }
+
+  return `更新 ${name} 相关逻辑`;
 }
