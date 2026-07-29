@@ -2,7 +2,7 @@
   "name": "generate-git-commit",
   "displayName": "AI Git Commit Message Generator",
   "description": "使用 AI 自动生成符合规范的 Git 提交消息",
-  "version": "1.1.6",
+  "version": "1.2.0",
   "publisher": "shumin",
   "icon": "icon.png",
   "engines": {
@@ -85,17 +85,17 @@
         "generateGitCommit.model": {
           "type": "string",
           "default": "gpt-4o-mini",
-          "description": "使用的 AI 模型名称"
+          "description": "Diff 分析模型名称；模型上下文需容纳 Prompt、文件清单、分段内容及最多 500 个输出 token"
         },
         "generateGitCommit.customPrompt": {
           "type": "string",
           "default": "",
-          "description": "自定义 Prompt（留空使用默认 Prompt）"
+          "description": "自定义 Diff 分析 Prompt；留空使用内置 Prompt（当前 1920 个 JavaScript 字符）"
         },
         "generateGitCommit.outputTemplate": {
           "type": "string",
           "default": "{title}\n\n修改内容：\n{changes}\n\n涉及组件：\n{files}",
-          "description": "输出模板，支持占位符 {title}、{changes}、{files}"
+          "description": "输出模板，支持占位符 {title}、{changes}、{files}；模板预览和文件清单会计入模型输入长度"
         },
         "generateGitCommit.redactPatterns": {
           "type": "array",
@@ -113,7 +113,44 @@
         "generateGitCommit.maxDiffLength": {
           "type": "number",
           "default": 10000,
-          "description": "最大 diff 内容长度（字符），超出将被截断"
+          "minimum": 1000,
+          "description": "单段 diff 上限（JavaScript UTF-16 字符）；内置分析 Prompt 空输入固定占 1972 字符，另需加文件清单、模板并预留最多 500 个输出 token；字符数不等于模型 token 数"
+        },
+        "generateGitCommit.diffMergeMode": {
+          "type": "string",
+          "default": "local",
+          "enum": [
+            "local",
+            "remote"
+          ],
+          "enumDescriptions": [
+            "本地拼接分段标题和文件描述，不增加归并请求",
+            "使用远程模型递归归并分段结果"
+          ],
+          "description": "超长 diff 分段结果的归并方式"
+        },
+        "generateGitCommit.diffConcurrency": {
+          "type": "number",
+          "default": 1,
+          "minimum": 1,
+          "maximum": 10,
+          "description": "Diff 分段分析与远程归并的最大并发请求数，1 表示串行"
+        },
+        "generateGitCommit.mergeModel": {
+          "type": "string",
+          "default": "",
+          "description": "远程归并模型名称（留空继承 model）；其上下文需容纳分段结果、归并 Prompt、文件清单、模板及最多 500 个输出 token"
+        },
+        "generateGitCommit.mergeRetryCount": {
+          "type": "number",
+          "default": 5,
+          "minimum": 0,
+          "description": "远程归并自动重试次数（不包含首次请求）"
+        },
+        "generateGitCommit.mergePrompt": {
+          "type": "string",
+          "default": "",
+          "description": "自定义远程归并 Prompt；留空使用内置 Prompt（当前 192 个 JavaScript 字符，空归并包装固定占 294 字符）"
         },
         "generateGitCommit.retryCount": {
           "type": "number",
@@ -147,6 +184,7 @@
     "vscode:prepublish": "pnpm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
+    "test": "node --test out/utils/largeDiff.test.js",
     "pretest": "pnpm run compile",
     "package": "vsce package --no-dependencies"
   },

@@ -43,13 +43,27 @@ pnpm run package
 | `chatCompletionsDelivery` | Chat Completions 正文获取策略：`non-stream-first` / `stream-first` | `non-stream-first` |
 | `apiKey` | AI API 密钥 | - |
 | `model` | 使用的模型名称 | `gpt-4o-mini` |
-| `customPrompt` | 自定义 Prompt | - |
+| `customPrompt` | 自定义 Diff 分析 Prompt | - |
 | `outputTemplate` | 输出模板（支持 `{title}`、`{changes}`、`{files}`） | - |
 | `redactPatterns` | diff 脱敏正则列表 | 预置常见模式 |
-| `maxDiffLength` | 最大 diff 长度 | `10000` |
+| `maxDiffLength` | 单次分析的最大 diff 长度，超出后自动分段 | `10000` |
+| `diffMergeMode` | 分段结果归并方式：`local` / `remote` | `local` |
+| `diffConcurrency` | 分段分析与远程归并并发数（`1-10`） | `1` |
+| `mergeModel` | 远程归并模型，留空继承 `model` | - |
+| `mergeRetryCount` | 远程归并重试次数（不包含首次请求） | `5` |
+| `mergePrompt` | 自定义远程归并 Prompt | - |
 | `retryCount` | 自动重试次数（不包含首次请求） | `5` |
 | `retryStatusCodes` | 触发自动重试的 HTTP 状态码列表 | `408, 429, 500, 502, 503, 504` |
 | `requestTimeoutMs` | API 请求超时时间（毫秒） | `60000` |
+
+### 模型长度计算
+
+- 内置 Diff 分析 Prompt 为 `1920` 个 JavaScript 字符；空输入固定包装后为 `1972` 个字符。
+- 内置远程归并 Prompt 为 `192` 个 JavaScript 字符；空归并包装后为 `294` 个字符。
+- 实际输入还包含文件清单、展开后的输出模板、Diff 分段或待归并结果；日志会记录每次请求的实际 Prompt 字符长度。
+- `maxDiffLength` 使用 JavaScript UTF-16 长度计算，中文通常占 1，emoji 等字符可能占 2；该字符数不等于模型 token 数。
+- 请求最多预留 `500` 个输出 token。应确保“实际输入 token + 500”不超过所选模型上下文窗口，并以模型服务商的 tokenizer 结果为准。
+- 使用 `customPrompt`、`mergePrompt` 或较长 `outputTemplate` 时，需要相应降低 `maxDiffLength`。
 
 ### 配置示例
 
@@ -120,6 +134,23 @@ pnpm run package
 }
 ```
 `retryStatusCodes` 填 HTTP 状态码数组即可；如需关闭按状态码重试可设为 `[]`（仍会对网络/超时重试）。
+
+**配置超长 Diff：**
+```json
+{
+  "generateGitCommit.maxDiffLength": 10000,
+  "generateGitCommit.diffMergeMode": "remote",
+  "generateGitCommit.diffConcurrency": 2,
+  "generateGitCommit.mergeModel": "gpt-4o-mini",
+  "generateGitCommit.mergeRetryCount": 5,
+  "generateGitCommit.mergePrompt": ""
+}
+```
+
+- Diff 超过 `maxDiffLength` 时优先按文件边界无损分段，单个文件超限时继续按行切分，不再截断内容。
+- `local` 模式直接拼接各段标题和文件描述；`remote` 模式使用归并模型分批递归归并。
+- 任一分段或远程归并请求重试耗尽后，整个生成流程失败，不会写入不完整的提交消息。
+- Diff 只有一段时不会触发额外的远程归并请求。
 
 **接口选择规则：**
 - `apiMode = auto` 时，若 `apiEndpoint` 已明确写成 `/v1/chat/completions` 或 `/v1/responses`，插件直接按该端点发送请求。

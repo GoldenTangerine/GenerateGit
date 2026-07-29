@@ -5,14 +5,21 @@
 
 import * as vscode from 'vscode';
 import * as logger from '../utils/logger';
-import { buildPrompt } from '../utils/prompt';
+import { buildMergePrompt, buildPrompt } from '../utils/prompt';
 import { extractChangedFilePaths } from '../utils/diff';
 import { DEFAULT_REDACT_PATTERNS, redactSensitiveText } from '../utils/redact';
 import { DEFAULT_OUTPUT_TEMPLATE, renderOutputTemplate, resolveOutputTemplate } from '../utils/outputTemplate';
+import {
+  createLengthLimitedBatches,
+  mapWithConcurrency,
+  mergeCommitMessagesLocally,
+  splitDiffIntoChunks
+} from '../utils/largeDiff';
 
 type ApiMode = 'auto' | 'chat-completions' | 'responses';
 type ResolvedApiMode = Exclude<ApiMode, 'auto'>;
 type ChatCompletionsDelivery = 'non-stream-first' | 'stream-first';
+type DiffMergeMode = 'local' | 'remote';
 
 const DEFAULT_RETRY_COUNT = 5;
 const DEFAULT_REQUEST_TIMEOUT_MS = 60000;
@@ -25,6 +32,13 @@ const DEFAULT_API_ENDPOINT = 'https://api.openai.com/v1';
 const DEFAULT_MODEL = 'gpt-4o-mini';
 const DEFAULT_API_MODE: ApiMode = 'auto';
 const DEFAULT_CHAT_COMPLETIONS_DELIVERY: ChatCompletionsDelivery = 'non-stream-first';
+const DEFAULT_MAX_DIFF_LENGTH = 10000;
+const MIN_MAX_DIFF_LENGTH = 1000;
+const DEFAULT_DIFF_MERGE_MODE: DiffMergeMode = 'local';
+const DEFAULT_DIFF_CONCURRENCY = 1;
+const MAX_DIFF_CONCURRENCY = 10;
+const DEFAULT_MERGE_RETRY_COUNT = 5;
+const MAX_MERGE_ROUNDS = 20;
 const OPENAI_API_HOSTS = new Set(['api.openai.com']);
 const RESPONSE_BODY_READ_TIMEOUT_MS = 1200;
 const RESPONSE_BODY_MAX_CHARS = 4000;
@@ -96,6 +110,11 @@ interface GenerateCommitConfig {
   outputTemplate: string;
   redactPatterns: string[];
   maxDiffLength: number;
+  diffMergeMode: DiffMergeMode;
+  diffConcurrency: number;
+  mergeModel: string;
+  mergeRetryCount: number;
+  mergePrompt: string;
   retryCount: number;
   requestTimeoutMs: number;
   retryStatusCodes: number[];
@@ -133,7 +152,15 @@ function getConfig(): GenerateCommitConfig {
     customPrompt: config.get<string>('customPrompt') || '',
     outputTemplate: config.get<string>('outputTemplate') || '',
     redactPatterns: config.get<string[]>('redactPatterns') || [],
-    maxDiffLength: config.get<number>('maxDiffLength') || 10000,
+    maxDiffLength: resolveMaxDiffLength(config.get<number>('maxDiffLength')),
+    diffMergeMode: resolveDiffMergeMode(config.get<string>('diffMergeMode')),
+    diffConcurrency: resolveDiffConcurrency(config.get<number>('diffConcurrency')),
+    mergeModel: config.get<string>('mergeModel')?.trim() || '',
+    mergeRetryCount: resolveRetryCount(
+      config.get<number>('mergeRetryCount'),
+      DEFAULT_MERGE_RETRY_COUNT
+    ),
+    mergePrompt: config.get<string>('mergePrompt') || '',
     retryCount: resolveRetryCount(config.get<number>('retryCount')),
     requestTimeoutMs: resolveTimeoutMs(config.get<number>('requestTimeoutMs')),
     retryStatusCodes: resolveRetryStatusCodes(config.get<number[]>('retryStatusCodes'))
@@ -262,32 +289,41 @@ function isOfficialOpenAiHost(hostname: string): boolean {
   return OPENAI_API_HOSTS.has(hostname.toLowerCase());
 }
 
-/**
- * 截断 diff 内容
- */
-function truncateDiff(diff: string, maxLength: number): string {
-  if (diff.length <= maxLength) {
-    return diff;
-  }
-
-  logger.warn(`Diff 内容过长 (${diff.length} 字符)，将截断至 ${maxLength} 字符`);
-
-  // 尝试在文件边界处截断
-  const truncated = diff.substring(0, maxLength);
-  const lastDiffHeader = truncated.lastIndexOf('\ndiff --git');
-
-  if (lastDiffHeader > maxLength * 0.5) {
-    return truncated.substring(0, lastDiffHeader) + '\n\n... (部分内容已省略)';
-  }
-
-  return truncated + '\n\n... (部分内容已省略)';
-}
-
-function resolveRetryCount(value: number | undefined): number {
+function resolveRetryCount(value: number | undefined, defaultValue = DEFAULT_RETRY_COUNT): number {
   if (typeof value !== 'number' || Number.isNaN(value)) {
-    return DEFAULT_RETRY_COUNT;
+    return defaultValue;
   }
   return Math.max(0, Math.floor(value));
+}
+
+function resolveMaxDiffLength(value: number | undefined): number {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return DEFAULT_MAX_DIFF_LENGTH;
+  }
+
+  const normalized = Math.floor(value);
+  if (normalized < MIN_MAX_DIFF_LENGTH) {
+    logger.warn(`maxDiffLength 不能小于 ${MIN_MAX_DIFF_LENGTH}，已按最小值处理`);
+    return MIN_MAX_DIFF_LENGTH;
+  }
+  return normalized;
+}
+
+function resolveDiffMergeMode(value: string | undefined): DiffMergeMode {
+  if (value === 'local' || value === 'remote') {
+    return value;
+  }
+  if (typeof value === 'string' && value.trim()) {
+    logger.warn(`diffMergeMode 配置无效: ${value}，已回退为 ${DEFAULT_DIFF_MERGE_MODE}`);
+  }
+  return DEFAULT_DIFF_MERGE_MODE;
+}
+
+function resolveDiffConcurrency(value: number | undefined): number {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return DEFAULT_DIFF_CONCURRENCY;
+  }
+  return Math.min(MAX_DIFF_CONCURRENCY, Math.max(1, Math.floor(value)));
 }
 
 function resolveTimeoutMs(value: number | undefined): number {
@@ -1231,15 +1267,8 @@ export async function generateCommitMessage(diff: string): Promise<string> {
     logger.warn('outputTemplate 缺少必要占位符，已回退为默认模板');
   }
 
-  // 截断过长的 diff
-  const truncatedDiff = truncateDiff(redactionResult.text, config.maxDiffLength);
-
-  // 构建 Prompt
-  const prompt = buildPrompt(truncatedDiff, {
-    customPrompt: config.customPrompt || undefined,
-    fileList: changedFiles,
-    outputTemplate: resolvedTemplate
-  });
+  // 对超长 diff 进行无损分段
+  const diffChunks = splitDiffIntoChunks(redactionResult.text, config.maxDiffLength);
 
   const retryStatusLabel = config.retryStatusCodes.length > 0
     ? config.retryStatusCodes.join(', ')
@@ -1248,6 +1277,12 @@ export async function generateCommitMessage(diff: string): Promise<string> {
     { label: '接口地址', value: apiTarget.endpoint },
     { label: '接口模式', value: apiTarget.mode },
     { label: '模型', value: config.model },
+    { label: 'Diff 分段', value: `${diffChunks.length} 段` },
+    { label: '归并方式', value: config.diffMergeMode === 'remote' ? '远程' : '本地' },
+    { label: '并发数', value: config.diffConcurrency },
+    config.diffMergeMode === 'remote' && diffChunks.length > 1
+      ? { label: '归并模型', value: config.mergeModel || config.model }
+      : undefined,
     apiTarget.mode === 'chat-completions'
       ? { label: '正文获取策略', value: describeChatCompletionsDelivery(config.chatCompletionsDelivery) }
       : undefined,
@@ -1260,36 +1295,53 @@ export async function generateCommitMessage(diff: string): Promise<string> {
   }
 
   try {
-    const requestPayload = buildRequestPayload(apiTarget, config.model, prompt);
     const requestOptions: RequestWithRetryOptions = {
       retryCount: config.retryCount,
       timeoutMs: config.requestTimeoutMs,
       retryStatusCodes: new Set(config.retryStatusCodes)
     };
+    const partialMessages = await mapWithConcurrency(
+      diffChunks,
+      config.diffConcurrency,
+      async (chunk, index) => {
+        const chunkFiles = extractChangedFilePaths(chunk);
+        // 构建 Prompt
+        const prompt = buildPrompt(chunk, {
+          customPrompt: config.customPrompt || undefined,
+          fileList: chunkFiles,
+          outputTemplate: resolvedTemplate
+        });
+        logger.info(
+          `正在分析 Diff 分段 ${index + 1}/${diffChunks.length}，Diff：${chunk.length} 字符，Prompt：${prompt.length} 字符`
+        );
+        const result = await requestAiMessage(apiTarget, config, config.model, prompt, requestOptions);
+        if (result.usageData) {
+          logUsage(apiTarget.mode, result.usageData);
+        }
+        return normalizeCommitMessage(cleanMarkdownCodeBlock(result.text), chunkFiles, resolvedTemplate);
+      }
+    );
 
-    let message: string;
-    let usageData: ChatCompletionResponse | ResponsesApiResponse | undefined;
-    if (apiTarget.mode === 'chat-completions') {
-      const result = await resolveChatCompletionsMessage(apiTarget, config, requestPayload, requestOptions);
-      message = result.text;
-      usageData = result.usageData;
+    let normalizedMessage: string;
+    if (partialMessages.length === 1) {
+      normalizedMessage = normalizeCommitMessage(partialMessages[0], changedFiles, resolvedTemplate);
+    } else if (config.diffMergeMode === 'remote') {
+      normalizedMessage = await mergeCommitMessagesRemotely(
+        partialMessages,
+        changedFiles,
+        resolvedTemplate,
+        apiTarget,
+        config
+      );
     } else {
-      const data = await requestJsonApiData(apiTarget, config.apiKey, config.model, requestPayload, requestOptions);
-      message = extractGeneratedText(apiTarget.mode, data);
-      usageData = data;
+      normalizedMessage = renderLocalMergedMessage(partialMessages, changedFiles, resolvedTemplate);
     }
-
-    // 清理可能的 markdown 代码块包裹
-    const cleanedMessage = cleanMarkdownCodeBlock(message);
-    const normalizedMessage = normalizeCommitMessage(cleanedMessage, changedFiles, resolvedTemplate);
 
     logger.infoBlock('提交消息生成完成', [
       { label: '涉及文件', value: changedFiles.length },
+      { label: 'Diff 分段', value: diffChunks.length },
       { label: '输出模板', value: resolvedTemplate === DEFAULT_OUTPUT_TEMPLATE ? '默认模板' : '自定义模板' }
     ]);
-    if (usageData) {
-      logUsage(apiTarget.mode, usageData);
-    }
 
     return normalizedMessage;
   } catch (error) {
@@ -1313,6 +1365,102 @@ export async function generateCommitMessage(diff: string): Promise<string> {
     }
     throw new Error('未知错误');
   }
+}
+
+/**
+ * 使用指定模型调用现有 API 请求链路
+ */
+async function requestAiMessage(
+  apiTarget: ResolvedApiTarget,
+  config: GenerateCommitConfig,
+  model: string,
+  prompt: string,
+  requestOptions: RequestWithRetryOptions
+): Promise<{ text: string; usageData?: ChatCompletionResponse | ResponsesApiResponse }> {
+  const requestPayload = buildRequestPayload(apiTarget, model, prompt);
+  if (apiTarget.mode === 'chat-completions') {
+    return resolveChatCompletionsMessage(
+      apiTarget,
+      { ...config, model },
+      requestPayload,
+      requestOptions
+    );
+  }
+
+  const data = await requestJsonApiData(apiTarget, config.apiKey, model, requestPayload, requestOptions);
+  return {
+    text: extractGeneratedText(apiTarget.mode, data),
+    usageData: data
+  };
+}
+
+/**
+ * 按长度分批并递归归并提交信息
+ */
+async function mergeCommitMessagesRemotely(
+  messages: string[],
+  files: string[],
+  template: string,
+  apiTarget: ResolvedApiTarget,
+  config: GenerateCommitConfig
+): Promise<string> {
+  const mergeModel = config.mergeModel || config.model;
+  const requestOptions: RequestWithRetryOptions = {
+    retryCount: config.mergeRetryCount,
+    timeoutMs: config.requestTimeoutMs,
+    retryStatusCodes: new Set(config.retryStatusCodes)
+  };
+  let current = messages;
+
+  for (let round = 1; round <= MAX_MERGE_ROUNDS && current.length > 1; round += 1) {
+    const batches = createLengthLimitedBatches(current, config.maxDiffLength);
+    logger.info(`正在执行远程归并第 ${round} 轮，共 ${batches.length} 批`);
+    current = await mapWithConcurrency(
+      batches,
+      config.diffConcurrency,
+      async (batch, index) => {
+        const batchFiles = findReferencedFiles(batch, files);
+        logger.info(`正在归并第 ${round} 轮 ${index + 1}/${batches.length}`);
+        const prompt = buildMergePrompt(batch, {
+          mergePrompt: config.mergePrompt || undefined,
+          fileList: batchFiles,
+          outputTemplate: template
+        });
+        logger.info(`远程归并 Prompt 长度：${prompt.length} 字符`);
+        const result = await requestAiMessage(apiTarget, config, mergeModel, prompt, requestOptions);
+        if (result.usageData) {
+          logUsage(apiTarget.mode, result.usageData);
+        }
+        return normalizeCommitMessage(cleanMarkdownCodeBlock(result.text), batchFiles, template);
+      }
+    );
+  }
+
+  if (current.length !== 1) {
+    throw new Error(`远程归并在 ${MAX_MERGE_ROUNDS} 轮内未能收敛，请增大 maxDiffLength 后重试`);
+  }
+  return normalizeCommitMessage(current[0], files, template);
+}
+
+/**
+ * 从当前归并批次中筛选原始文件清单
+ */
+function findReferencedFiles(messages: string[], files: string[]): string[] {
+  const combined = messages.join('\n');
+  return files.filter((file) => combined.includes(file));
+}
+
+/**
+ * 使用本地归并结果渲染最终输出模板
+ */
+function renderLocalMergedMessage(messages: string[], files: string[], template: string): string {
+  const merged = mergeCommitMessagesLocally(messages, files);
+  const title = merged.title || '🐳 chore: 更新提交信息';
+  const changeLines = files.map((file) => {
+    const description = merged.descriptions.get(file) || buildFallbackDescription(file);
+    return `- ${file}：${description}`;
+  });
+  return renderOutputTemplate(template, title, changeLines, files);
 }
 
 /**

@@ -137,6 +137,20 @@ index 2222222..3333333 100644
 }
 
 /**
+ * 生成默认的远程归并 Prompt
+ */
+export function getDefaultMergePrompt(): string {
+  return `你是一个专业的 Git 提交消息归并器。请将多段 Git diff 分析结果合并为一条完整、准确的中文提交消息。
+
+## 规则
+
+1. 保留所有分段结果中的有效变更，不得遗漏文件或变更含义
+2. 合并重复文件的描述，删除重复表述，不得虚构未出现的变更
+3. 根据全部变更生成一个最合适的 emoji、type、scope 和中文主题
+4. 严格按照提供的输出模板输出，不要添加说明文字`;
+}
+
+/**
  * 构建完整的 Prompt
  * @param diff Git diff 内容
  * @param options 构建参数
@@ -176,4 +190,39 @@ ${diff}
 \`\`\`
 
 请根据上述 diff 内容生成提交消息：`;
+}
+
+/**
+ * 构建远程归并 Prompt
+ */
+export function buildMergePrompt(
+  messages: string[],
+  options: {
+    mergePrompt?: string;
+    fileList: string[];
+    outputTemplate?: string;
+  }
+): string {
+  const systemPrompt = options.mergePrompt || getDefaultMergePrompt();
+  const resolvedTemplate = resolveOutputTemplate(options.outputTemplate);
+  const outputTemplate = buildOutputTemplatePreview(resolvedTemplate, options.fileList);
+  const messageSections = messages
+    .map((message, index) => `### 分段结果 ${index + 1}\n\n${message}`)
+    .join('\n\n');
+
+  return `${systemPrompt}
+
+## 本批次变更文件清单
+
+${options.fileList.map((file) => `- ${file}`).join('\n')}
+
+## 输出模板
+
+${outputTemplate}
+
+## 待归并的分段结果
+
+${messageSections}
+
+请只输出归并后的提交消息：`;
 }
