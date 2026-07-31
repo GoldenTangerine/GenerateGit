@@ -24,6 +24,19 @@ export interface LocalCommitMergeResult {
   changes: FileChange[];
 }
 
+export interface CommitMessageValidationResult {
+  valid: boolean;
+  missingTitle: boolean;
+  missingFiles: string[];
+}
+
+export interface RetryAsyncTaskOptions {
+  retryCount: number;
+  signal?: AbortSignal;
+  getDelayMs?: (attempt: number) => number;
+  onRetry?: (error: unknown, attempt: number, maxAttempts: number, delayMs: number) => void;
+}
+
 /**
  * 按文件边界优先拆分 Diff，确保每段不超过指定字符数
  */
@@ -98,28 +111,91 @@ export function createLengthLimitedBatches(texts: string[], maxLength: number): 
 export async function mapWithConcurrency<T, R>(
   items: T[],
   concurrency: number,
-  worker: (item: T, index: number) => Promise<R>
+  worker: (item: T, index: number) => Promise<R>,
+  signal?: AbortSignal
 ): Promise<R[]> {
   const results = new Array<R>(items.length);
   let nextIndex = 0;
   let stopped = false;
+  let hasError = false;
+  let firstError: unknown;
 
   async function runWorker(): Promise<void> {
-    while (!stopped && nextIndex < items.length) {
+    while (!stopped && !signal?.aborted && nextIndex < items.length) {
       const index = nextIndex;
       nextIndex += 1;
       try {
         results[index] = await worker(items[index], index);
       } catch (error) {
         stopped = true;
-        throw error;
+        if (!hasError) {
+          hasError = true;
+          firstError = error;
+        }
       }
     }
   }
 
   const workerCount = Math.min(concurrency, items.length);
   await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+  if (hasError) {
+    throw firstError;
+  }
+  if (signal?.aborted) {
+    throw createAbortError();
+  }
   return results;
+}
+
+/**
+ * 独立重试单个异步任务，重试计数不会与其他任务共享
+ */
+export async function retryAsyncTask<T>(
+  task: (attempt: number) => Promise<T>,
+  options: RetryAsyncTaskOptions
+): Promise<T> {
+  const normalizedRetryCount = Number.isFinite(options.retryCount)
+    ? Math.max(0, Math.floor(options.retryCount))
+    : 0;
+  const maxAttempts = normalizedRetryCount + 1;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    throwIfAborted(options.signal);
+    try {
+      return await task(attempt);
+    } catch (error) {
+      if (options.signal?.aborted) {
+        throw createAbortError();
+      }
+      if (attempt >= maxAttempts) {
+        throw error;
+      }
+
+      const configuredDelayMs = options.getDelayMs?.(attempt) ?? 0;
+      const delayMs = Number.isFinite(configuredDelayMs)
+        ? Math.max(0, Math.floor(configuredDelayMs))
+        : 0;
+      options.onRetry?.(error, attempt, maxAttempts, delayMs);
+      await waitForDelay(delayMs, options.signal);
+    }
+  }
+
+  throw new Error('异步任务重试失败');
+}
+
+/**
+ * 校验模型输出是否包含标题和每个文件的变更描述
+ */
+export function validateCommitMessage(message: string, files: string[]): CommitMessageValidationResult {
+  const missingTitle = !extractCommitTitle(message);
+  const describedFiles = new Set(parseFileChanges(message, files).map((change) => change.file));
+  const missingFiles = files.filter((file) => !describedFiles.has(file));
+
+  return {
+    valid: !missingTitle && missingFiles.length === 0,
+    missingTitle,
+    missingFiles
+  };
 }
 
 /**
@@ -306,4 +382,41 @@ function buildFallbackDescription(file: string): string {
   }
 
   return `更新 ${name} 相关逻辑`;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw createAbortError();
+  }
+}
+
+export function createAbortError(): Error {
+  const error = new Error('操作已取消');
+  error.name = 'AbortError';
+  return error;
+}
+
+export function waitForDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) {
+    throwIfAborted(signal);
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      signal?.removeEventListener('abort', handleAbort);
+      resolve();
+    }, ms);
+    const handleAbort = () => {
+      clearTimeout(timeoutId);
+      signal?.removeEventListener('abort', handleAbort);
+      reject(createAbortError());
+    };
+
+    if (signal?.aborted) {
+      handleAbort();
+      return;
+    }
+    signal?.addEventListener('abort', handleAbort, { once: true });
+  });
 }

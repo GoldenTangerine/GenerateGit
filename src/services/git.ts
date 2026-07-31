@@ -12,6 +12,7 @@ let gitAPI: GitAPI | undefined;
 
 interface ResolveRepositoryOptions {
   promptOnAmbiguous?: boolean;
+  signal?: AbortSignal;
 }
 
 interface RepositoryQuickPickItem extends vscode.QuickPickItem {
@@ -103,7 +104,11 @@ export async function resolveRepository(
     : undefined;
 
   if (options.promptOnAmbiguous) {
-    const selectedRepository = await pickRepository(repositories, activeEditorRepository);
+    const selectedRepository = await pickRepository(
+      repositories,
+      activeEditorRepository,
+      options.signal
+    );
     if (selectedRepository) {
       logger.info(`用户选择仓库：${getRepositoryLabel(selectedRepository)}`);
     }
@@ -176,10 +181,11 @@ export function getCurrentBranch(repository: Repository): string | undefined {
   return repository.state.HEAD.name;
 }
 
-function pickRepository(
+async function pickRepository(
   repositories: Repository[],
-  activeEditorRepository?: Repository
-): Thenable<Repository | undefined> {
+  activeEditorRepository?: Repository,
+  signal?: AbortSignal
+): Promise<Repository | undefined> {
   const sortedRepositories = [...repositories].sort((left, right) => {
     if (!activeEditorRepository) {
       return 0;
@@ -216,10 +222,24 @@ function pickRepository(
     };
   });
 
-  return vscode.window.showQuickPick(items, {
-    placeHolder: '检测到多个 Git 仓库，请选择要生成提交消息的仓库',
-    ignoreFocusOut: true
-  }).then((item) => item?.repository);
+  const cancellationTokenSource = new vscode.CancellationTokenSource();
+  const handleAbort = () => cancellationTokenSource.cancel();
+  if (signal?.aborted) {
+    handleAbort();
+  } else {
+    signal?.addEventListener('abort', handleAbort, { once: true });
+  }
+
+  try {
+    const item = await vscode.window.showQuickPick(items, {
+      placeHolder: '检测到多个 Git 仓库，请选择要生成提交消息的仓库',
+      ignoreFocusOut: true
+    }, cancellationTokenSource.token);
+    return item?.repository;
+  } finally {
+    signal?.removeEventListener('abort', handleAbort);
+    cancellationTokenSource.dispose();
+  }
 }
 
 function getRepositoryFromContext(

@@ -2,7 +2,7 @@
   "name": "generate-git-commit",
   "displayName": "AI Git Commit Message Generator",
   "description": "使用 AI 自动生成符合规范的 Git 提交消息",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "publisher": "shumin",
   "icon": "icon.png",
   "engines": {
@@ -183,7 +183,7 @@
           "type": "number",
           "default": 5,
           "minimum": 0,
-          "description": "远程归并自动重试次数（不包含首次请求）"
+          "description": "远程归并底层请求与每个完整归并批次的自动重试次数（不包含首次请求）"
         },
         "generateGitCommit.mergePrompt": {
           "type": "string",
@@ -193,7 +193,7 @@
         "generateGitCommit.retryCount": {
           "type": "number",
           "default": 5,
-          "description": "自动重试次数（不包含首次请求）"
+          "description": "底层请求与每个 Diff 分段完整分析的自动重试次数（不包含首次请求）"
         },
         "generateGitCommit.retryStatusCodes": {
           "type": "array",
@@ -208,12 +208,12 @@
             503,
             504
           ],
-          "description": "触发自动重试的 HTTP 状态码列表（默认不包含 404，避免接口地址或模式配置错误时无意义重试）"
+          "description": "触发底层 HTTP 立即重试的状态码列表；完整分段和归并批次仍会对其他错误执行外层重试"
         },
         "generateGitCommit.requestTimeoutMs": {
           "type": "number",
           "default": 60000,
-          "description": "API 请求超时时间（毫秒）"
+          "description": "单次底层 API 请求全流程超时时间（毫秒），包含连接、响应体读取和解析"
         }
       }
     }

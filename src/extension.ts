@@ -10,10 +10,13 @@ import * as aiService from './services/ai';
 import * as statusBar from './handlers/statusBar';
 import * as logger from './utils/logger';
 
+let activeGenerationController: AbortController | undefined;
+
 /**
  * 扩展激活时调用
  */
 export async function activate(context: vscode.ExtensionContext) {
+  logger.initialize();
   logger.info('AI Git Commit Message Generator 扩展正在激活...');
 
   // 初始化 Git API
@@ -31,7 +34,11 @@ export async function activate(context: vscode.ExtensionContext) {
     'generate-git-commit.generate',
     (...args: unknown[]) => generateCommitMessageCommand(args.length <= 1 ? args[0] : args)
   );
-  context.subscriptions.push(generateCommand);
+  const cancelCommand = vscode.commands.registerCommand(
+    statusBar.CANCEL_GENERATION_COMMAND,
+    cancelCommitMessageGeneration
+  );
+  context.subscriptions.push(generateCommand, cancelCommand);
 
   logger.info('AI Git Commit Message Generator 扩展已激活');
 }
@@ -40,33 +47,49 @@ export async function activate(context: vscode.ExtensionContext) {
  * 生成提交消息的命令处理函数
  */
 async function generateCommitMessageCommand(commandContext?: unknown) {
-  logger.info('开始生成提交消息...');
-
-  const repository = await gitService.resolveRepository(commandContext, {
-    promptOnAmbiguous: true
-  });
-
-  if (!repository) {
-    vscode.window.showWarningMessage('未能确定当前 Git 仓库，请在目标仓库的 SCM 面板中重试');
-    logger.warn('未能确定目标仓库，取消生成');
+  if (activeGenerationController) {
+    vscode.window.showInformationMessage('提交消息正在生成');
     return;
   }
 
-  const repositoryLabel = gitService.getRepositoryLabel(repository);
-
-  // 检查是否有暂存的变更
-  if (!gitService.hasStagedChanges(repository)) {
-    vscode.window.showWarningMessage(`[${repositoryLabel}] 没有暂存的变更，请先使用 git add 暂存文件`);
-    logger.info(`仓库 ${repositoryLabel} 没有暂存的变更，取消生成`);
-    return;
-  }
+  const controller = new AbortController();
+  activeGenerationController = controller;
 
   // 设置加载状态
   statusBar.setLoadingState();
+  logger.info('开始生成提交消息...');
 
   try {
+    const repository = await gitService.resolveRepository(commandContext, {
+      promptOnAmbiguous: true,
+      signal: controller.signal
+    });
+    if (controller.signal.aborted) {
+      throw new vscode.CancellationError();
+    }
+
+    if (!repository) {
+      statusBar.setNormalState();
+      vscode.window.showWarningMessage('未能确定当前 Git 仓库，请在目标仓库的 SCM 面板中重试');
+      logger.warn('未能确定目标仓库，取消生成');
+      return;
+    }
+
+    const repositoryLabel = gitService.getRepositoryLabel(repository);
+
+    // 检查是否有暂存的变更
+    if (!gitService.hasStagedChanges(repository)) {
+      statusBar.setNormalState();
+      vscode.window.showWarningMessage(`[${repositoryLabel}] 没有暂存的变更，请先使用 git add 暂存文件`);
+      logger.info(`仓库 ${repositoryLabel} 没有暂存的变更，取消生成`);
+      return;
+    }
+
     // 获取暂存区的 diff
     const diff = await gitService.getStagedDiff(repository);
+    if (controller.signal.aborted) {
+      throw new vscode.CancellationError();
+    }
 
     if (!diff) {
       statusBar.setErrorState();
@@ -75,7 +98,12 @@ async function generateCommitMessageCommand(commandContext?: unknown) {
     }
 
     // 调用 AI 生成提交消息
-    const commitMessage = await aiService.generateCommitMessage(diff);
+    const commitMessage = await aiService.generateCommitMessage(diff, controller.signal);
+    if (controller.signal.aborted) {
+      statusBar.setNormalState();
+      logger.info('已取消生成提交消息');
+      return;
+    }
 
     // 设置到 SCM 输入框
     const success = gitService.setCommitMessage(repository, commitMessage);
@@ -91,13 +119,32 @@ async function generateCommitMessageCommand(commandContext?: unknown) {
       vscode.window.showErrorMessage('无法设置提交消息');
     }
   } catch (error) {
+    if (controller.signal.aborted) {
+      statusBar.setNormalState();
+      logger.info('已取消生成提交消息');
+      return;
+    }
+
     statusBar.setErrorState();
 
     const errorMessage = error instanceof Error ? error.message : '未知错误';
     logger.error('生成提交消息失败', error as Error);
 
     vscode.window.showErrorMessage(`生成提交消息失败: ${errorMessage}`);
+  } finally {
+    if (activeGenerationController === controller) {
+      activeGenerationController = undefined;
+    }
   }
+}
+
+function cancelCommitMessageGeneration(): void {
+  if (!activeGenerationController) {
+    return;
+  }
+
+  logger.info('正在取消生成提交消息...');
+  activeGenerationController.abort();
 }
 
 /**
@@ -105,6 +152,8 @@ async function generateCommitMessageCommand(commandContext?: unknown) {
  */
 export function deactivate() {
   logger.info('AI Git Commit Message Generator 扩展正在停用...');
+  activeGenerationController?.abort();
+  activeGenerationController = undefined;
   statusBar.dispose();
   logger.dispose();
 }

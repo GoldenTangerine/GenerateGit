@@ -13,11 +13,22 @@ export interface LogField {
 }
 
 let outputChannel: vscode.LogOutputChannel | undefined;
+let disposed = false;
+
+/**
+ * 允许扩展重新激活后恢复日志输出
+ */
+export function initialize(): void {
+  disposed = false;
+}
 
 /**
  * 获取输出通道
  */
-function getChannel(): vscode.LogOutputChannel {
+function getChannel(): vscode.LogOutputChannel | undefined {
+  if (disposed) {
+    return undefined;
+  }
   if (!outputChannel) {
     outputChannel = vscode.window.createOutputChannel('AI Git Commit', { log: true });
   }
@@ -76,13 +87,14 @@ export function errorBlock(title: string, fields: Array<LogField | undefined> = 
  * 显示输出通道
  */
 export function show(): void {
-  getChannel().show();
+  getChannel()?.show();
 }
 
 /**
  * 销毁输出通道
  */
 export function dispose(): void {
+  disposed = true;
   if (outputChannel) {
     outputChannel.dispose();
     outputChannel = undefined;
@@ -91,6 +103,9 @@ export function dispose(): void {
 
 function write(level: LogLevel, message: string): void {
   const channel = getChannel();
+  if (!channel) {
+    return;
+  }
   const normalized = normalizeMessage(message);
 
   if (level === 'info') {

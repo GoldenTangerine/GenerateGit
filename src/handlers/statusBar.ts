@@ -6,7 +6,10 @@
 import * as vscode from 'vscode';
 import * as logger from '../utils/logger';
 
+export const CANCEL_GENERATION_COMMAND = 'generate-git-commit.cancel';
+
 let statusBarItem: vscode.StatusBarItem | undefined;
+let restoreTimeout: ReturnType<typeof setTimeout> | undefined;
 
 /**
  * 创建状态栏项
@@ -34,8 +37,11 @@ export function createStatusBarItem(): vscode.StatusBarItem {
  * 设置正常状态
  */
 export function setNormalState(): void {
+  clearRestoreTimeout();
   if (statusBarItem) {
     statusBarItem.text = '$(sparkle) 生成提交';
+    statusBarItem.command = 'generate-git-commit.generate';
+    statusBarItem.tooltip = '点击生成 Git 提交消息';
     statusBarItem.backgroundColor = undefined;
   }
 }
@@ -44,8 +50,11 @@ export function setNormalState(): void {
  * 设置加载状态
  */
 export function setLoadingState(): void {
+  clearRestoreTimeout();
   if (statusBarItem) {
-    statusBarItem.text = '$(loading~spin) 生成中...';
+    statusBarItem.text = '$(loading~spin) 取消生成';
+    statusBarItem.command = CANCEL_GENERATION_COMMAND;
+    statusBarItem.tooltip = '点击取消生成';
     statusBarItem.backgroundColor = new vscode.ThemeColor(
       'statusBarItem.warningBackground'
     );
@@ -56,14 +65,17 @@ export function setLoadingState(): void {
  * 设置成功状态（短暂显示后恢复正常）
  */
 export function setSuccessState(): void {
+  clearRestoreTimeout();
   if (statusBarItem) {
     statusBarItem.text = '$(check) 已生成';
+    statusBarItem.command = 'generate-git-commit.generate';
+    statusBarItem.tooltip = '点击生成 Git 提交消息';
     statusBarItem.backgroundColor = new vscode.ThemeColor(
       'statusBarItem.prominentBackground'
     );
 
     // 2秒后恢复正常状态
-    setTimeout(() => {
+    restoreTimeout = setTimeout(() => {
       setNormalState();
     }, 2000);
   }
@@ -73,14 +85,17 @@ export function setSuccessState(): void {
  * 设置错误状态（短暂显示后恢复正常）
  */
 export function setErrorState(): void {
+  clearRestoreTimeout();
   if (statusBarItem) {
     statusBarItem.text = '$(error) 生成失败';
+    statusBarItem.command = 'generate-git-commit.generate';
+    statusBarItem.tooltip = '点击生成 Git 提交消息';
     statusBarItem.backgroundColor = new vscode.ThemeColor(
       'statusBarItem.errorBackground'
     );
 
     // 3秒后恢复正常状态
-    setTimeout(() => {
+    restoreTimeout = setTimeout(() => {
       setNormalState();
     }, 3000);
   }
@@ -90,9 +105,17 @@ export function setErrorState(): void {
  * 销毁状态栏项
  */
 export function dispose(): void {
+  clearRestoreTimeout();
   if (statusBarItem) {
     statusBarItem.dispose();
     statusBarItem = undefined;
     logger.info('状态栏项已销毁');
+  }
+}
+
+function clearRestoreTimeout(): void {
+  if (restoreTimeout) {
+    clearTimeout(restoreTimeout);
+    restoreTimeout = undefined;
   }
 }

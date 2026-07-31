@@ -17,7 +17,9 @@ import {
   mapWithConcurrency,
   mergeCommitMessagesLocally,
   parseFileChanges,
-  splitDiffIntoChunks
+  retryAsyncTask,
+  splitDiffIntoChunks,
+  validateCommitMessage
 } from './largeDiff';
 import { extractChangedFilePaths } from './diff';
 import { buildMergePrompt, buildPrompt, getDefaultMergePrompt, getDefaultPrompt } from './prompt';
@@ -85,6 +87,22 @@ test('并发调度保持顺序且不超过上限', async () => {
   assert.equal(maxActive, 2);
 });
 
+test('并发任务全部完成后才进入后续归并阶段', async () => {
+  const events: string[] = [];
+  const results = await mapWithConcurrency([20, 5], 2, async (delay, index) => {
+    events.push(`start-${index + 1}`);
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    events.push(`complete-${index + 1}`);
+    return `result-${index + 1}`;
+  });
+  events.push('merge');
+
+  assert.deepEqual(results, ['result-1', 'result-2']);
+  assert.equal(events.at(-1), 'merge');
+  assert.ok(events.indexOf('merge') > events.indexOf('complete-1'));
+  assert.ok(events.indexOf('merge') > events.indexOf('complete-2'));
+});
+
 test('任一并发任务失败时整体失败', async () => {
   const started: number[] = [];
   await assert.rejects(
@@ -99,6 +117,103 @@ test('任一并发任务失败时整体失败', async () => {
     /request failed/
   );
   assert.ok(started.length <= 2);
+});
+
+test('每个并发任务独立计算完整重试次数', async () => {
+  const attempts = [0, 0];
+  const results = await mapWithConcurrency([10, 20], 2, (value, index) => retryAsyncTask(async () => {
+    attempts[index] += 1;
+    if (index === 1 && attempts[index] < 3) {
+      throw new Error('temporary failure');
+    }
+    return value * 2;
+  }, {
+    retryCount: 2,
+    getDelayMs: () => 0
+  }));
+
+  assert.deepEqual(results, [20, 40]);
+  assert.deepEqual(attempts, [1, 3]);
+});
+
+test('完整重试耗尽后抛出最后一次错误', async () => {
+  let attempts = 0;
+  await assert.rejects(
+    retryAsyncTask(async () => {
+      attempts += 1;
+      throw new Error(`failure-${attempts}`);
+    }, {
+      retryCount: 2,
+      getDelayMs: () => 0
+    }),
+    /failure-3/
+  );
+  assert.equal(attempts, 3);
+});
+
+test('取消后不再执行或重试任务', async () => {
+  const controller = new AbortController();
+  let attempts = 0;
+  controller.abort();
+
+  await assert.rejects(
+    retryAsyncTask(async () => {
+      attempts += 1;
+      throw new Error('request failed');
+    }, {
+      retryCount: 5,
+      signal: controller.signal
+    }),
+    (error: Error) => error.name === 'AbortError'
+  );
+  assert.equal(attempts, 0);
+});
+
+test('退避等待期间取消会立即停止后续重试', async () => {
+  const controller = new AbortController();
+  let attempts = 0;
+
+  await assert.rejects(
+    retryAsyncTask(async () => {
+      attempts += 1;
+      throw new Error('request failed');
+    }, {
+      retryCount: 5,
+      signal: controller.signal,
+      getDelayMs: () => 1000,
+      onRetry: () => controller.abort()
+    }),
+    (error: Error) => error.name === 'AbortError'
+  );
+  assert.equal(attempts, 1);
+});
+
+test('模型输出需要标题和每个文件的变更描述', () => {
+  const validMessage = [
+    '✨ feat(core): 新增能力',
+    '- [新增] src/a.ts：增加解析入口',
+    '- [修改] src/b.ts：调整空值处理'
+  ].join('\n');
+  const missingFileMessage = [
+    '✨ feat(core): 新增能力',
+    '- [新增] src/a.ts：增加解析入口'
+  ].join('\n');
+
+  assert.deepEqual(validateCommitMessage(validMessage, ['src/a.ts', 'src/b.ts']), {
+    valid: true,
+    missingTitle: false,
+    missingFiles: []
+  });
+  assert.deepEqual(validateCommitMessage(missingFileMessage, ['src/a.ts', 'src/b.ts']), {
+    valid: false,
+    missingTitle: false,
+    missingFiles: ['src/b.ts']
+  });
+  assert.deepEqual(validateCommitMessage('- [修改] src/a.ts：调整逻辑', ['src/a.ts']), {
+    valid: false,
+    missingTitle: true,
+    missingFiles: []
+  });
 });
 
 test('本地归并直接拼接标题并合并重复文件描述', () => {

@@ -21,12 +21,16 @@ import { DEFAULT_OUTPUT_TEMPLATE, renderOutputTemplate, resolveOutputTemplate } 
 import { buildRequestPayload } from '../utils/requestPayload';
 import {
   buildChangeLines,
+  createAbortError,
   createLengthLimitedBatches,
   extractCommitTitle,
   mapWithConcurrency,
   mergeCommitMessagesLocally,
   parseFileChanges,
-  splitDiffIntoChunks
+  retryAsyncTask,
+  splitDiffIntoChunks,
+  validateCommitMessage,
+  waitForDelay
 } from '../utils/largeDiff';
 
 type ApiMode = 'auto' | 'chat-completions' | 'responses';
@@ -63,6 +67,7 @@ interface RequestWithRetryOptions {
   retryCount: number;
   timeoutMs: number;
   retryStatusCodes: Set<number>;
+  signal?: AbortSignal;
 }
 
 /**
@@ -695,47 +700,47 @@ async function requestJsonApiData(
   payload: Record<string, unknown>,
   options: RequestWithRetryOptions
 ): Promise<ChatCompletionResponse | ResponsesApiResponse> {
-  const response = await requestWithRetry(apiTarget.endpoint, {
+  return requestWithRetry(apiTarget.endpoint, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${apiKey}`
     },
     body: JSON.stringify(payload)
-  }, options);
+  }, options, async (response) => {
+    if (!response.ok) {
+      const responseDetails = await extractResponseErrorDetails(response);
+      logger.errorBlock('API 请求失败', buildResponseLogFields(response, responseDetails, [
+        { label: '接口地址', value: apiTarget.endpoint },
+        { label: '接口模式', value: apiTarget.mode },
+        { label: '模型', value: model }
+      ]));
+      throw new Error(buildHttpErrorMessage(response.status, response.statusText, apiTarget));
+    }
 
-  if (!response.ok) {
-    const responseDetails = await extractResponseErrorDetails(response);
-    logger.errorBlock('API 请求失败', buildResponseLogFields(response, responseDetails, [
-      { label: '接口地址', value: apiTarget.endpoint },
-      { label: '接口模式', value: apiTarget.mode },
-      { label: '模型', value: model }
-    ]));
-    throw new Error(buildHttpErrorMessage(response.status, response.statusText, apiTarget));
-  }
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.includes('application/json')) {
+      const bodyPreview = await response.text();
+      const preview = bodyPreview.substring(0, 200);
+      logger.errorBlock('API 响应格式异常', [
+        { label: '响应类型', value: contentType || '未知' },
+        { label: '接口地址', value: apiTarget.endpoint },
+        { label: '响应预览', value: compactText(preview, 200) || '响应体为空' }
+      ]);
 
-  const contentType = response.headers.get('content-type') || '';
-  if (!contentType.includes('application/json')) {
-    const bodyPreview = await response.text();
-    const preview = bodyPreview.substring(0, 200);
-    logger.errorBlock('API 响应格式异常', [
-      { label: '响应类型', value: contentType || '未知' },
-      { label: '接口地址', value: apiTarget.endpoint },
-      { label: '响应预览', value: compactText(preview, 200) || '响应体为空' }
-    ]);
+      if (bodyPreview.trimStart().startsWith('<') || contentType.includes('text/html')) {
+        throw new Error(
+          'API 端点返回了 HTML 页面而非 JSON 数据，请检查 API 地址是否正确。当前端点: ' + apiTarget.endpoint
+        );
+      }
 
-    if (bodyPreview.trimStart().startsWith('<') || contentType.includes('text/html')) {
       throw new Error(
-        'API 端点返回了 HTML 页面而非 JSON 数据，请检查 API 地址是否正确。当前端点: ' + apiTarget.endpoint
+        `API 端点返回了非 JSON 格式的数据 (Content-Type: ${contentType})，请检查 API 配置`
       );
     }
 
-    throw new Error(
-      `API 端点返回了非 JSON 格式的数据 (Content-Type: ${contentType})，请检查 API 配置`
-    );
-  }
-
-  return await response.json() as ChatCompletionResponse | ResponsesApiResponse;
+    return await response.json() as ChatCompletionResponse | ResponsesApiResponse;
+  });
 }
 
 async function resolveChatCompletionsMessage(
@@ -757,6 +762,9 @@ async function resolveChatCompletionsMessage(
         usageData: createChatCompletionUsageEnvelope(config.model, streamResult.usage)
       };
     } catch (error) {
+      if (requestOptions.signal?.aborted) {
+        throw createAbortError();
+      }
       logger.warnBlock('优先流式解析失败，准备回退到非流式请求', [
         { label: '接口地址', value: apiTarget.endpoint },
         { label: '模型', value: config.model },
@@ -796,7 +804,7 @@ async function requestChatCompletionTextFromStream(
   payload: Record<string, unknown>,
   options: RequestWithRetryOptions
 ): Promise<ChatCompletionStreamResult> {
-  const response = await requestWithRetry(endpoint, {
+  return requestWithRetry(endpoint, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -807,27 +815,27 @@ async function requestChatCompletionTextFromStream(
       ...payload,
       stream: true
     })
-  }, options);
+  }, options, async (response) => {
+    if (!response.ok) {
+      const responseDetails = await extractResponseErrorDetails(response);
+      logger.errorBlock('流式回退请求失败', buildResponseLogFields(response, responseDetails, [
+        { label: '接口地址', value: endpoint }
+      ]));
+      throw new Error(buildStatusLabel(response));
+    }
 
-  if (!response.ok) {
-    const responseDetails = await extractResponseErrorDetails(response);
-    logger.errorBlock('流式回退请求失败', buildResponseLogFields(response, responseDetails, [
-      { label: '接口地址', value: endpoint }
-    ]));
-    throw new Error(buildStatusLabel(response));
-  }
+    const rawStream = await response.text();
+    const streamResult = extractChatCompletionStreamText(rawStream);
+    if (streamResult.text) {
+      return streamResult;
+    }
 
-  const rawStream = await response.text();
-  const streamResult = extractChatCompletionStreamText(rawStream);
-  if (streamResult.text) {
-    return streamResult;
-  }
-
-  logger.errorBlock('流式回退未提取到正文', [
-    { label: '接口地址', value: endpoint },
-    { label: '响应预览', value: compactText(rawStream, RESPONSE_PREVIEW_MAX_CHARS) || '响应体为空' }
-  ]);
-  throw new Error('API 流式响应中未包含可用文本');
+    logger.errorBlock('流式回退未提取到正文', [
+      { label: '接口地址', value: endpoint },
+      { label: '响应预览', value: compactText(rawStream, RESPONSE_PREVIEW_MAX_CHARS) || '响应体为空' }
+    ]);
+    throw new Error('API 流式响应中未包含可用文本');
+  });
 }
 
 function extractChatCompletionStreamText(rawStream: string): ChatCompletionStreamResult {
@@ -1171,31 +1179,35 @@ function buildStatusLabel(response: Response): string {
   return response.statusText ? `${response.status} ${response.statusText}` : `${response.status}`;
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    return await fetch(url, {
-      ...init,
-      signal: controller.signal
-    });
-  } finally {
-    clearTimeout(timeoutId);
-  }
-}
-
-async function requestWithRetry(
+async function requestWithRetry<T>(
   url: string,
   init: RequestInit,
-  options: { retryCount: number; timeoutMs: number; retryStatusCodes: Set<number> }
-): Promise<Response> {
+  options: RequestWithRetryOptions,
+  consumeResponse: (response: Response) => Promise<T>
+): Promise<T> {
   const maxAttempts = options.retryCount + 1;
   let consecutiveNotFound = 0;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    if (options.signal?.aborted) {
+      throw createAbortError();
+    }
+
+    const controller = new AbortController();
+    let timedOut = false;
+    let retryDelayMs: number | undefined;
+    const handleCancellation = () => controller.abort();
+    const timeoutId = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, options.timeoutMs);
+    options.signal?.addEventListener('abort', handleCancellation, { once: true });
+
     try {
-      const response = await fetchWithTimeout(url, init, options.timeoutMs);
+      const response = await fetch(url, {
+        ...init,
+        signal: controller.signal
+      });
 
       if (
         !response.ok &&
@@ -1220,26 +1232,36 @@ async function requestWithRetry(
           { label: '重试进度', value: `${attempt}/${maxAttempts - 1}` }
         ]));
         discardResponseBody(response);
-        await sleep(delayMs);
-        continue;
+        retryDelayMs = delayMs;
+      } else {
+        consecutiveNotFound = 0;
+        return await consumeResponse(response);
       }
-
-      consecutiveNotFound = 0;
-      return response;
     } catch (error) {
-      if (attempt < maxAttempts && isRetryableFetchError(error)) {
+      if (options.signal?.aborted) {
+        throw createAbortError();
+      }
+      if (attempt < maxAttempts && (timedOut || isRetryableFetchError(error))) {
         const delayMs = getRetryDelayMs(attempt);
-        const reason = isAbortError(error) ? '请求超时' : '网络异常';
+        const reason = timedOut ? '请求超时' : '网络异常';
         logger.warnBlock('API 请求异常，准备重试', [
           { label: '原因', value: reason },
           { label: '等待重试', value: `${delayMs}ms` },
           { label: '重试进度', value: `${attempt}/${maxAttempts - 1}` },
           error instanceof Error ? { label: '错误信息', value: error.message } : undefined
         ]);
-        await sleep(delayMs);
-        continue;
+        retryDelayMs = delayMs;
+      } else {
+        throw error;
       }
-      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+      options.signal?.removeEventListener('abort', handleCancellation);
+    }
+
+    if (retryDelayMs !== undefined) {
+      await waitForDelay(retryDelayMs, options.signal);
+      continue;
     }
   }
 
@@ -1249,7 +1271,10 @@ async function requestWithRetry(
 /**
  * 调用 AI API 生成提交消息
  */
-export async function generateCommitMessage(diff: string): Promise<string> {
+export async function generateCommitMessage(diff: string, signal?: AbortSignal): Promise<string> {
+  if (signal?.aborted) {
+    throw createAbortError();
+  }
   const config = getConfig();
   const apiTarget = resolveApiTarget(config.apiEndpoint, config.apiMode);
   if (apiTarget.endpoint !== config.apiEndpoint) {
@@ -1317,7 +1342,8 @@ export async function generateCommitMessage(diff: string): Promise<string> {
     const requestOptions: RequestWithRetryOptions = {
       retryCount: config.retryCount,
       timeoutMs: config.requestTimeoutMs,
-      retryStatusCodes: new Set(config.retryStatusCodes)
+      retryStatusCodes: new Set(config.retryStatusCodes),
+      signal
     };
     const partialMessages = await mapWithConcurrency(
       diffChunks,
@@ -1335,12 +1361,34 @@ export async function generateCommitMessage(diff: string): Promise<string> {
         logger.info(
           `正在分析 Diff 分段 ${index + 1}/${diffChunks.length}，Diff：${chunk.length} 字符，Prompt：${prompt.length} 字符`
         );
-        const result = await requestAiMessage(apiTarget, config, config.model, prompt, requestOptions);
+        const contextLabel = `Diff 分段 ${index + 1}/${diffChunks.length}`;
+        const result = await requestValidatedAiMessage(
+          apiTarget,
+          config,
+          config.model,
+          prompt,
+          chunkFiles,
+          requestOptions,
+          contextLabel
+        );
         if (result.usageData) {
           logUsage(apiTarget.mode, result.usageData);
         }
-        return normalizeCommitMessage(cleanMarkdownCodeBlock(result.text), chunkFiles, resolvedTemplate);
-      }
+        return normalizeCommitMessage(result.text, chunkFiles, resolvedTemplate);
+      },
+      signal
+    );
+    const incompleteChunkIndexes = Array.from(
+      { length: diffChunks.length },
+      (_, index) => partialMessages[index]?.trim() ? undefined : index + 1
+    ).filter((index): index is number => index !== undefined);
+    if (partialMessages.length !== diffChunks.length || incompleteChunkIndexes.length > 0) {
+      throw new Error(`Diff 分段分析结果不完整：${incompleteChunkIndexes.join(', ') || '分段数量不匹配'}`);
+    }
+    logger.info(
+      partialMessages.length > 1
+        ? `Diff 分段分析完成，共 ${partialMessages.length} 段，准备归并`
+        : 'Diff 分段分析完成，共 1 段'
     );
 
     let normalizedMessage: string;
@@ -1352,7 +1400,8 @@ export async function generateCommitMessage(diff: string): Promise<string> {
         changedFiles,
         resolvedTemplate,
         apiTarget,
-        config
+        config,
+        signal
       );
     } else {
       normalizedMessage = renderLocalMergedMessage(partialMessages, changedFiles, resolvedTemplate);
@@ -1366,6 +1415,9 @@ export async function generateCommitMessage(diff: string): Promise<string> {
 
     return normalizedMessage;
   } catch (error) {
+    if (signal?.aborted) {
+      throw createAbortError();
+    }
     if (error instanceof Error) {
       if (error.name === 'AbortError') {
         throw new Error(`API 请求超时（${config.requestTimeoutMs}ms），请稍后重试或检查网络环境`);
@@ -1373,7 +1425,7 @@ export async function generateCommitMessage(diff: string): Promise<string> {
       if (error.message.includes('fetch')) {
         throw new Error('网络请求失败，请检查网络连接和 API 端点配置');
       }
-      if (error instanceof SyntaxError) {
+      if (error.name === 'SyntaxError') {
         logger.errorBlock('API 响应 JSON 解析失败', [
           { label: '错误信息', value: error.message },
           { label: '接口地址', value: apiTarget.endpoint }
@@ -1416,6 +1468,64 @@ async function requestAiMessage(
 }
 
 /**
+ * 对单个 Diff 分段或归并批次执行完整请求重试
+ */
+async function requestValidatedAiMessage(
+  apiTarget: ResolvedApiTarget,
+  config: GenerateCommitConfig,
+  model: string,
+  prompt: string,
+  files: string[],
+  requestOptions: RequestWithRetryOptions,
+  contextLabel: string
+): Promise<{ text: string; usageData?: ChatCompletionResponse | ResponsesApiResponse }> {
+  try {
+    return await retryAsyncTask(async () => {
+      const result = await requestAiMessage(apiTarget, config, model, prompt, requestOptions);
+      const cleanedText = cleanMarkdownCodeBlock(result.text);
+      const validation = validateCommitMessage(cleanedText, files);
+      if (!validation.valid) {
+        const missingFields = [
+          validation.missingTitle ? '标题' : undefined,
+          validation.missingFiles.length > 0
+            ? `文件描述（${validation.missingFiles.join(', ')}）`
+            : undefined
+        ].filter((value): value is string => Boolean(value));
+        throw new Error(`API 返回结果缺少${missingFields.join('、')}`);
+      }
+
+      return {
+        ...result,
+        text: cleanedText
+      };
+    }, {
+      retryCount: requestOptions.retryCount,
+      signal: requestOptions.signal,
+      getDelayMs: getRetryDelayMs,
+      onRetry: (error, attempt, maxAttempts, delayMs) => {
+        logger.warnBlock(`${contextLabel} 完整请求失败，准备重试`, [
+          { label: '等待重试', value: `${delayMs}ms` },
+          { label: '完整重试进度', value: `${attempt}/${maxAttempts - 1}` },
+          { label: '错误信息', value: getErrorMessage(error) }
+        ]);
+      }
+    });
+  } catch (error) {
+    if (requestOptions.signal?.aborted) {
+      throw createAbortError();
+    }
+    const wrappedError = new Error(
+      `${contextLabel} 完整请求重试耗尽：${getErrorMessage(error)}`,
+      error instanceof Error ? { cause: error } : undefined
+    );
+    if (error instanceof Error) {
+      wrappedError.name = error.name;
+    }
+    throw wrappedError;
+  }
+}
+
+/**
  * 按长度分批并递归归并提交信息
  */
 async function mergeCommitMessagesRemotely(
@@ -1423,13 +1533,15 @@ async function mergeCommitMessagesRemotely(
   files: string[],
   template: string,
   apiTarget: ResolvedApiTarget,
-  config: GenerateCommitConfig
+  config: GenerateCommitConfig,
+  signal?: AbortSignal
 ): Promise<string> {
   const mergeModel = config.mergeModel || config.model;
   const requestOptions: RequestWithRetryOptions = {
     retryCount: config.mergeRetryCount,
     timeoutMs: config.requestTimeoutMs,
-    retryStatusCodes: new Set(config.retryStatusCodes)
+    retryStatusCodes: new Set(config.retryStatusCodes),
+    signal
   };
   let current = messages;
 
@@ -1450,12 +1562,22 @@ async function mergeCommitMessagesRemotely(
           descriptionLengthRange: config.descriptionLengthRange
         });
         logger.info(`远程归并 Prompt 长度：${prompt.length} 字符`);
-        const result = await requestAiMessage(apiTarget, config, mergeModel, prompt, requestOptions);
+        const contextLabel = `远程归并第 ${round} 轮 ${index + 1}/${batches.length}`;
+        const result = await requestValidatedAiMessage(
+          apiTarget,
+          config,
+          mergeModel,
+          prompt,
+          batchFiles,
+          requestOptions,
+          contextLabel
+        );
         if (result.usageData) {
           logUsage(apiTarget.mode, result.usageData);
         }
-        return normalizeCommitMessage(cleanMarkdownCodeBlock(result.text), batchFiles, template);
-      }
+        return normalizeCommitMessage(result.text, batchFiles, template);
+      },
+      signal
     );
   }
 
@@ -1513,4 +1635,8 @@ function normalizeCommitMessage(message: string, files: string[], template: stri
   const changeLines = buildChangeLines(files, parseFileChanges(trimmed, files));
 
   return renderOutputTemplate(template, title, changeLines, files);
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : `${error}`;
 }
