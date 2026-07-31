@@ -13,6 +13,7 @@ export interface LogField {
 }
 
 let outputChannel: vscode.LogOutputChannel | undefined;
+let thinkingOutputChannel: vscode.OutputChannel | undefined;
 let disposed = false;
 
 /**
@@ -33,6 +34,16 @@ function getChannel(): vscode.LogOutputChannel | undefined {
     outputChannel = vscode.window.createOutputChannel('AI Git Commit', { log: true });
   }
   return outputChannel;
+}
+
+function getThinkingChannel(): vscode.OutputChannel | undefined {
+  if (disposed) {
+    return undefined;
+  }
+  if (!thinkingOutputChannel) {
+    thinkingOutputChannel = vscode.window.createOutputChannel('AI Git Commit 思考');
+  }
+  return thinkingOutputChannel;
 }
 
 /**
@@ -90,6 +101,34 @@ export function show(): void {
   getChannel()?.show();
 }
 
+export function clearThinkingOutput(): void {
+  thinkingOutputChannel?.clear();
+}
+
+export function printThinkingOutput(
+  context: string,
+  mode: string,
+  model: string,
+  content?: string,
+  reasoningTokens?: number
+): void {
+  const channel = getThinkingChannel();
+  if (!channel) {
+    return;
+  }
+
+  channel.appendLine(`[${context}] ${mode} / ${model}`);
+  if (content?.trim()) {
+    channel.appendLine(content.trim());
+  } else {
+    channel.appendLine('未返回思考内容');
+  }
+  if (typeof reasoningTokens === 'number') {
+    channel.appendLine(`思考 Token: ${reasoningTokens}`);
+  }
+  channel.appendLine('');
+}
+
 /**
  * 销毁输出通道
  */
@@ -98,6 +137,10 @@ export function dispose(): void {
   if (outputChannel) {
     outputChannel.dispose();
     outputChannel = undefined;
+  }
+  if (thinkingOutputChannel) {
+    thinkingOutputChannel.dispose();
+    thinkingOutputChannel = undefined;
   }
 }
 

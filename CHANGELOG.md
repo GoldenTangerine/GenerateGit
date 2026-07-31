@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.3.3 - 2026-07-31
+
+### Added
+- 新增跨 Anthropic、OpenAI Chat 与 Responses 的思考开关和思考强度配置
+- 新增按接口模式深度合并的 `requestBodyOverrides` 请求字段配置
+- 思考摘要输出到每次生成前清空的临时输出通道，不写入插件日志文件
+
+### Changed
+- OpenAI Chat 思考请求使用 `max_completion_tokens`，Responses 继续使用 `max_output_tokens`
+- 内置思考参数不受支持时自动移除并重试一次，无效思考强度仍保留上游错误
+- OpenAI 兼容端点不再默认发送 `stream_options`，并串行化同一模型的首次思考能力探测
+- Anthropic 用量仅使用官方 `input_tokens` 与 `output_tokens` 字段
+
 ## v1.3.2 - 2026-07-31
 
 ### Added

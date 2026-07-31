@@ -43,6 +43,9 @@ pnpm run package
 | `chatCompletionsDelivery` | Anthropic / OpenAI Chat 正文获取策略：`non-stream-first` / `stream-first` | `non-stream-first` |
 | `apiKey` | AI API 密钥 | - |
 | `model` | 使用的模型名称 | `gpt-4o-mini` |
+| `thinkingEnabled` | 是否发送当前接口模式的内置思考参数 | `true` |
+| `thinkingEffort` | 思考强度，支持值由模型和服务商决定 | `medium` |
+| `requestBodyOverrides` | 按接口模式深度合并的自定义请求体字段 | `{}` |
 | `customPrompt` | 自定义 Diff 分析 Prompt | - |
 | `outputTemplate` | 输出模板（支持 `{title}`、`{changes}`、`{files}`） | - |
 | `titleLengthRange` | 标题长度目标：`10-20` / `20-35` / `35-50` | `20-35` |
@@ -58,6 +61,42 @@ pnpm run package
 | `retryCount` | 底层请求和每个 Diff 分段完整分析的重试次数 | `5` |
 | `retryStatusCodes` | 触发底层 HTTP 立即重试的状态码列表 | `408, 429, 500, 502, 503, 504` |
 | `requestTimeoutMs` | 单次底层请求全流程超时（毫秒） | `60000` |
+
+### 思考配置
+
+开启 `thinkingEnabled` 后，插件按实际接口模式发送对应参数：
+
+| 接口模式 | 思考参数 | 输出上限 |
+|----------|----------|----------|
+| `openai-responses` | `reasoning.effort`，并请求 `summary: auto` | `max_output_tokens` |
+| `openai-chat` | `reasoning_effort` | `max_completion_tokens` |
+| `anthropic` | `thinking.type: adaptive` 与 `output_config.effort` | `max_tokens` |
+
+- 开启内置思考时默认不发送 `temperature`，避免推理模型拒绝非默认采样参数。
+- 关闭内置思考时不发送思考字段，并保留原有 `temperature` 和 Token 字段。
+- 上游明确拒绝内置思考字段时，插件会移除这些字段并自动重试一次；无效思考强度仍直接报错。
+- 接口返回的思考摘要会完整打印到临时的“AI Git Commit 思考”输出通道，每次生成前自动清空，不写入插件日志文件。
+- OpenAI 和 Anthropic 返回的是思考摘要或 Token 统计，不是原始思维链。
+- OpenAI 官方 Chat 流式请求会获取 reasoning Token；兼容端点默认不发送 `stream_options`，需要时可通过 `requestBodyOverrides` 配置。
+- Anthropic 官方用量将思考计入 `output_tokens`，不提供独立的思考 Token 字段。
+
+`requestBodyOverrides` 可覆盖当前模式的非核心字段或注入兼容网关参数：
+
+```json
+{
+  "generateGitCommit.thinkingEnabled": false,
+  "generateGitCommit.requestBodyOverrides": {
+    "openai-chat": {
+      "thinking": {
+        "enabled": true
+      },
+      "reasoning_level": "medium"
+    }
+  }
+}
+```
+
+`model`、`messages`、`input`、`stream` 是受保护字段，JSON 覆盖中的同名字段会被忽略。
 
 ### 模型长度计算
 

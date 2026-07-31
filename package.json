@@ -2,7 +2,7 @@
   "name": "generate-git-commit",
   "displayName": "AI Git Commit Message Generator",
   "description": "使用 AI 自动生成符合规范的 Git 提交消息",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "publisher": "shumin",
   "icon": "icon.png",
   "engines": {
@@ -88,6 +88,36 @@
           "type": "string",
           "default": "gpt-4o-mini",
           "description": "Diff 分析模型名称；模型上下文需容纳 Prompt、文件清单、分段内容和最大输出 token"
+        },
+        "generateGitCommit.thinkingEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否按当前接口模式发送内置思考参数；关闭后仍可通过 requestBodyOverrides 注入自定义字段"
+        },
+        "generateGitCommit.thinkingEffort": {
+          "type": "string",
+          "default": "medium",
+          "description": "思考强度，默认 medium；具体可用值由模型和服务商决定"
+        },
+        "generateGitCommit.requestBodyOverrides": {
+          "type": "object",
+          "default": {},
+          "properties": {
+            "anthropic": {
+              "type": "object",
+              "description": "合并到 Anthropic Messages 请求体的自定义字段"
+            },
+            "openai-chat": {
+              "type": "object",
+              "description": "合并到 OpenAI Chat Completions 请求体的自定义字段"
+            },
+            "openai-responses": {
+              "type": "object",
+              "description": "合并到 OpenAI Responses 请求体的自定义字段"
+            }
+          },
+          "additionalProperties": false,
+          "description": "按实际接口模式深度合并的请求体字段；不能覆盖 model、messages、input、stream"
         },
         "generateGitCommit.customPrompt": {
           "type": "string",

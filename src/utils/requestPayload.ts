@@ -20,6 +20,24 @@ export interface ResolvedApiTarget extends RequestPayloadTarget {
   endpoint: string;
 }
 
+export type RequestBodyOverrides = Partial<Record<ResolvedApiMode, unknown>>;
+
+export interface ThinkingRequestOptions {
+  enabled: boolean;
+  effort: string;
+  overrides?: RequestBodyOverrides;
+}
+
+export interface BuiltRequestPayload {
+  payload: Record<string, unknown>;
+  ignoredOverrideFields: string[];
+}
+
+export interface ThinkingSupportState {
+  supportByKey: Map<string, boolean>;
+  probeByKey: Map<string, Promise<boolean>>;
+}
+
 export interface AnthropicUsage {
   input_tokens?: number;
   output_tokens?: number;
@@ -33,16 +51,33 @@ export interface AnthropicApiResponse {
   content: Array<{
     type: string;
     text?: string;
+    thinking?: string;
   }>;
   usage?: AnthropicUsage;
 }
 
 export interface AnthropicStreamResult {
   text: string;
+  thinking?: string;
   usage?: AnthropicUsage;
 }
 
+export interface ChatCompletionStreamResult {
+  text: string;
+  thinking?: string;
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+    completion_tokens_details?: {
+      reasoning_tokens?: number;
+    };
+  };
+}
+
 const OPENAI_API_HOSTS = new Set(['api.openai.com']);
+const PROTECTED_REQUEST_FIELDS = new Set(['model', 'messages', 'input', 'stream']);
+const UNSAFE_OBJECT_FIELDS = new Set(['__proto__', 'prototype', 'constructor']);
 export const ANTHROPIC_API_VERSION = '2023-06-01';
 
 export function normalizeApiMode(value: string | undefined): ApiMode | undefined {
@@ -133,14 +168,16 @@ export function buildRequestPayload(
   target: RequestPayloadTarget,
   model: string,
   prompt: string,
-  maxOutputTokens: number
-): Record<string, unknown> {
+  maxOutputTokens: number,
+  thinking: ThinkingRequestOptions
+): BuiltRequestPayload {
   const openAiStorePayload = target.isOfficialOpenAiHost && target.mode !== 'anthropic'
     ? { store: false }
     : {};
+  let payload: Record<string, unknown>;
 
   if (target.mode === 'openai-responses') {
-    return {
+    payload = {
       model,
       input: [
         {
@@ -148,14 +185,14 @@ export function buildRequestPayload(
           content: prompt
         }
       ],
-      temperature: 0.7,
       max_output_tokens: maxOutputTokens,
+      ...(thinking.enabled
+        ? { reasoning: { effort: thinking.effort, summary: 'auto' } }
+        : { temperature: 0.7 }),
       ...openAiStorePayload
     };
-  }
-
-  if (target.mode === 'anthropic') {
-    return {
+  } else if (target.mode === 'anthropic') {
+    payload = {
       model,
       messages: [
         {
@@ -163,23 +200,267 @@ export function buildRequestPayload(
           content: prompt
         }
       ],
-      temperature: 0.7,
-      max_tokens: maxOutputTokens
+      max_tokens: maxOutputTokens,
+      ...(thinking.enabled
+        ? {
+          thinking: { type: 'adaptive', display: 'summarized' },
+          output_config: { effort: thinking.effort }
+        }
+        : { temperature: 0.7 })
+    };
+  } else {
+    payload = {
+      model,
+      messages: [
+        {
+          role: 'user',
+          content: prompt
+        }
+      ],
+      ...(thinking.enabled
+        ? {
+          reasoning_effort: thinking.effort,
+          max_completion_tokens: maxOutputTokens
+        }
+        : {
+          temperature: 0.7,
+          max_tokens: maxOutputTokens
+        }),
+      ...openAiStorePayload
     };
   }
 
+  return mergeRequestBodyOverrides(payload, thinking.overrides?.[target.mode]);
+}
+
+export function buildChatCompletionStreamPayload(
+  payload: Record<string, unknown>,
+  includeUsage = false
+): Record<string, unknown> {
+  const configuredStreamOptions = payload.stream_options;
+  const streamOptions = includeUsage && isPlainObject(configuredStreamOptions)
+    ? { include_usage: true, ...configuredStreamOptions }
+    : includeUsage && configuredStreamOptions === undefined
+      ? { include_usage: true }
+      : configuredStreamOptions;
+
   return {
-    model,
-    messages: [
-      {
-        role: 'user',
-        content: prompt
-      }
-    ],
-    temperature: 0.7,
-    max_tokens: maxOutputTokens,
-    ...openAiStorePayload
+    ...payload,
+    ...(streamOptions !== undefined ? { stream_options: streamOptions } : {}),
+    stream: true
   };
+}
+
+export function mergeRequestBodyOverrides(
+  payload: Record<string, unknown>,
+  overrides: unknown
+): BuiltRequestPayload {
+  if (!isPlainObject(overrides)) {
+    return { payload, ignoredOverrideFields: [] };
+  }
+
+  const ignoredOverrideFields: string[] = [];
+  const allowedOverrides: Record<string, unknown> = {};
+  Object.entries(overrides).forEach(([key, value]) => {
+    if (PROTECTED_REQUEST_FIELDS.has(key) || UNSAFE_OBJECT_FIELDS.has(key)) {
+      ignoredOverrideFields.push(key);
+      return;
+    }
+    allowedOverrides[key] = value;
+  });
+
+  return {
+    payload: deepMergeObjects(payload, allowedOverrides),
+    ignoredOverrideFields
+  };
+}
+
+export async function requestWithThinkingFallback<T>(
+  state: ThinkingSupportState,
+  key: string,
+  request: (thinkingEnabled: boolean) => Promise<T>,
+  shouldDisableThinking: (error: unknown) => boolean,
+  onThinkingDisabled: (error: unknown) => void
+): Promise<T> {
+  const cachedSupport = state.supportByKey.get(key);
+  if (cachedSupport !== undefined) {
+    return request(cachedSupport);
+  }
+
+  const activeProbe = state.probeByKey.get(key);
+  if (activeProbe) {
+    return request(await activeProbe);
+  }
+
+  let resolveProbe: (supported: boolean) => void = () => undefined;
+  const probe = new Promise<boolean>((resolve) => {
+    resolveProbe = resolve;
+  });
+  state.probeByKey.set(key, probe);
+
+  try {
+    const result = await request(true);
+    state.supportByKey.set(key, true);
+    resolveProbe(true);
+    return result;
+  } catch (error) {
+    if (!shouldDisableThinking(error)) {
+      resolveProbe(true);
+      throw error;
+    }
+
+    state.supportByKey.set(key, false);
+    resolveProbe(false);
+    onThinkingDisabled(error);
+    return request(false);
+  } finally {
+    state.probeByKey.delete(key);
+  }
+}
+
+export function shouldFallbackThinkingRequest(
+  mode: ResolvedApiMode,
+  status: number,
+  errorText: string
+): boolean {
+  if (status !== 400 && status !== 422) {
+    return false;
+  }
+
+  const details = errorText.toLowerCase();
+  if (
+    /(?:invalid|unsupported)[_\s-]+(?:value|enum)/i.test(details)
+    || /effort[^.]{0,80}(?:must be|one of|allowed values?)/i.test(details)
+    || /["'][^"']+["'][^.]{0,80}(?:not supported|unsupported)[^.]{0,80}(?:effort|reasoning)/i.test(details)
+    || /effort\s+(?!is\b|not\b)(?:["']?[^\s"']+["']?)\s+(?:is\s+)?not supported/i.test(details)
+  ) {
+    return false;
+  }
+
+  if (!/unsupported|not supported|unknown (?:parameter|field)|unrecognized|not permitted|does not support/i.test(details)) {
+    return false;
+  }
+
+  const modeFields: Record<ResolvedApiMode, string[]> = {
+    'openai-responses': ['reasoning', 'summary'],
+    'openai-chat': ['reasoning_effort', 'max_completion_tokens'],
+    anthropic: ['thinking', 'output_config', 'adaptive', 'display']
+  };
+  return modeFields[mode].some((field) => details.includes(field));
+}
+
+export function sanitizeThinkingResponseText(rawText: string): string {
+  const sanitizeJson = (value: unknown): string => JSON.stringify(value, (key, fieldValue) => {
+    if (key === 'reasoning_content' || key === 'thinking' || key === 'summary') {
+      return '[思考内容仅输出到临时通道]';
+    }
+    return fieldValue;
+  });
+
+  try {
+    return sanitizeJson(JSON.parse(rawText));
+  } catch {
+    return rawText.split(/\r?\n/).map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) {
+        return line;
+      }
+
+      const payload = trimmed.slice(5).trim();
+      if (!payload || payload === '[DONE]') {
+        return line;
+      }
+
+      try {
+        return `data: ${sanitizeJson(JSON.parse(payload))}`;
+      } catch {
+        return /["'](?:reasoning_content|thinking|summary)["']\s*:/i.test(payload)
+          ? 'data: [思考内容仅输出到临时通道]'
+          : line;
+      }
+    }).join('\n');
+  }
+}
+
+function deepMergeObjects(
+  base: Record<string, unknown>,
+  overrides: Record<string, unknown>
+): Record<string, unknown> {
+  const result: Record<string, unknown> = { ...base };
+
+  Object.entries(overrides).forEach(([key, value]) => {
+    if (UNSAFE_OBJECT_FIELDS.has(key)) {
+      return;
+    }
+    const current = result[key];
+    result[key] = isPlainObject(current) && isPlainObject(value)
+      ? deepMergeObjects(current, value)
+      : cloneJsonValue(value);
+  });
+
+  return result;
+}
+
+function cloneJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(cloneJsonValue);
+  }
+  if (isPlainObject(value)) {
+    return deepMergeObjects({}, value);
+  }
+  return value;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+export function extractResponseThinking(mode: ResolvedApiMode, data: unknown): string | undefined {
+  if (!data || typeof data !== 'object') {
+    return undefined;
+  }
+
+  const record = data as Record<string, unknown>;
+  let fragments: string[] = [];
+  if (mode === 'openai-chat') {
+    const choices = Array.isArray(record.choices) ? record.choices as Array<Record<string, unknown>> : [];
+    fragments = choices.map((choice) => {
+      const message = choice.message as Record<string, unknown> | undefined;
+      return typeof message?.reasoning_content === 'string' ? message.reasoning_content : '';
+    });
+  } else if (mode === 'openai-responses') {
+    const output = Array.isArray(record.output) ? record.output as Array<Record<string, unknown>> : [];
+    fragments = output
+      .filter((item) => item.type === 'reasoning')
+      .flatMap((item) => Array.isArray(item.summary) ? item.summary as Array<Record<string, unknown>> : [])
+      .map((item) => typeof item.text === 'string' ? item.text : '');
+  } else {
+    const content = Array.isArray(record.content) ? record.content as Array<Record<string, unknown>> : [];
+    fragments = content
+      .filter((item) => item.type === 'thinking')
+      .map((item) => typeof item.thinking === 'string' ? item.thinking : '');
+  }
+
+  const thinking = fragments.filter(Boolean).join('\n').trim();
+  return thinking || undefined;
+}
+
+export function extractResponseReasoningTokens(mode: ResolvedApiMode, data: unknown): number | undefined {
+  if (mode === 'anthropic' || !data || typeof data !== 'object') {
+    return undefined;
+  }
+  const usage = (data as Record<string, unknown>).usage as Record<string, unknown> | undefined;
+  if (!usage) {
+    return undefined;
+  }
+
+  const detailsKey = mode === 'openai-chat' ? 'completion_tokens_details' : 'output_tokens_details';
+  const details = usage[detailsKey] as Record<string, unknown> | undefined;
+  return typeof details?.reasoning_tokens === 'number' ? details.reasoning_tokens : undefined;
 }
 
 export function extractAnthropicResponseText(data: AnthropicApiResponse): string {
@@ -194,8 +475,84 @@ export function extractAnthropicResponseText(data: AnthropicApiResponse): string
     .trim();
 }
 
+export function extractAnthropicResponseThinking(data: AnthropicApiResponse): string {
+  if (!Array.isArray(data.content)) {
+    return '';
+  }
+
+  return data.content
+    .filter((block) => block?.type === 'thinking' && typeof block.thinking === 'string')
+    .map((block) => block.thinking || '')
+    .join('\n')
+    .trim();
+}
+
+export function extractChatCompletionStreamText(rawStream: string): ChatCompletionStreamResult {
+  const fragments: string[] = [];
+  const thinkingFragments: string[] = [];
+  let usage: ChatCompletionStreamResult['usage'];
+
+  rawStream.split(/\r?\n/).forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) {
+      return;
+    }
+
+    const payload = trimmed.slice(5).trim();
+    if (!payload || payload === '[DONE]') {
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(payload) as Record<string, unknown>;
+      const choices = Array.isArray(parsed.choices) ? parsed.choices as Array<Record<string, unknown>> : [];
+      const parsedUsage = parsed.usage as ChatCompletionStreamResult['usage'];
+      if (parsedUsage) {
+        usage = parsedUsage;
+      }
+      choices.forEach((choice) => {
+        const delta = choice.delta as Record<string, unknown> | undefined;
+        // 流式 delta 需直接取字符串，不做 trim，否则单独的 "\n" chunk 会被清除
+        if (typeof delta?.content === 'string') {
+          fragments.push(delta.content);
+        }
+        if (typeof delta?.reasoning_content === 'string') {
+          thinkingFragments.push(delta.reasoning_content);
+        }
+        if (typeof delta?.content === 'string' || typeof delta?.reasoning_content === 'string') {
+          return;
+        }
+
+        const message = choice.message as Record<string, unknown> | undefined;
+        if (typeof message?.content === 'string') {
+          fragments.push(message.content);
+        }
+        if (typeof message?.reasoning_content === 'string') {
+          thinkingFragments.push(message.reasoning_content);
+        }
+        if (typeof message?.content === 'string' || typeof message?.reasoning_content === 'string') {
+          return;
+        }
+
+        if (typeof choice.text === 'string') {
+          fragments.push(choice.text);
+        }
+      });
+    } catch {
+      // ignore malformed stream chunks and continue collecting usable deltas
+    }
+  });
+
+  return {
+    text: fragments.join('').trim(),
+    thinking: thinkingFragments.join('').trim() || undefined,
+    usage
+  };
+}
+
 export function extractAnthropicStreamText(rawStream: string): AnthropicStreamResult {
   const fragments: string[] = [];
+  const thinkingFragments: string[] = [];
   let inputTokens: number | undefined;
   let outputTokens: number | undefined;
   let receivedMessageStart = false;
@@ -228,6 +585,9 @@ export function extractAnthropicStreamText(rawStream: string): AnthropicStreamRe
         const delta = parsed.delta as Record<string, unknown> | undefined;
         if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
           fragments.push(delta.text);
+        }
+        if (delta?.type === 'thinking_delta' && typeof delta.thinking === 'string') {
+          thinkingFragments.push(delta.thinking);
         }
         return;
       }
@@ -276,6 +636,7 @@ export function extractAnthropicStreamText(rawStream: string): AnthropicStreamRe
 
   return {
     text: fragments.join('').trim(),
+    thinking: thinkingFragments.join('').trim() || undefined,
     usage
   };
 }

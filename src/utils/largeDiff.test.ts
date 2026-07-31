@@ -26,12 +26,21 @@ import { buildMergePrompt, buildPrompt, getDefaultMergePrompt, getDefaultPrompt 
 import { buildOutputTemplatePreview, DEFAULT_OUTPUT_TEMPLATE } from './outputTemplate';
 import {
   ANTHROPIC_API_VERSION,
+  buildChatCompletionStreamPayload,
   buildRequestHeaders,
   buildRequestPayload,
+  extractAnthropicResponseThinking,
   extractAnthropicResponseText,
   extractAnthropicStreamText,
+  extractChatCompletionStreamText,
+  extractResponseReasoningTokens,
+  extractResponseThinking,
+  mergeRequestBodyOverrides,
   normalizeApiMode,
-  resolveApiTarget
+  requestWithThinkingFallback,
+  resolveApiTarget,
+  sanitizeThinkingResponseText,
+  shouldFallbackThinkingRequest
 } from './requestPayload';
 
 test('未超限的 diff 保持为单段', () => {
@@ -349,28 +358,221 @@ test('请求负载为三种 API 模式设置最大输出 token', () => {
     { mode: 'openai-responses', isOfficialOpenAiHost: true },
     'gpt-4o-mini',
     'prompt',
-    10000
-  );
+    10000,
+    { enabled: true, effort: 'medium' }
+  ).payload;
   const chatPayload = buildRequestPayload(
     { mode: 'openai-chat', isOfficialOpenAiHost: false },
     'gpt-4o-mini',
     'prompt',
-    10000
-  );
+    10000,
+    { enabled: true, effort: 'medium' }
+  ).payload;
   const anthropicPayload = buildRequestPayload(
     { mode: 'anthropic', isOfficialOpenAiHost: false },
     'claude-sonnet-4-5',
     'prompt',
-    10000
-  );
+    10000,
+    { enabled: true, effort: 'medium' }
+  ).payload;
 
   assert.equal(responsesPayload.max_output_tokens, 10000);
   assert.equal(responsesPayload.store, false);
-  assert.equal(chatPayload.max_tokens, 10000);
+  assert.deepEqual(responsesPayload.reasoning, { effort: 'medium', summary: 'auto' });
+  assert.equal('temperature' in responsesPayload, false);
+  assert.equal(chatPayload.max_completion_tokens, 10000);
+  assert.equal(chatPayload.reasoning_effort, 'medium');
+  assert.equal('temperature' in chatPayload, false);
   assert.equal('store' in chatPayload, false);
   assert.equal(anthropicPayload.max_tokens, 10000);
+  assert.deepEqual(anthropicPayload.thinking, { type: 'adaptive', display: 'summarized' });
+  assert.deepEqual(anthropicPayload.output_config, { effort: 'medium' });
+  assert.equal('temperature' in anthropicPayload, false);
   assert.equal('store' in anthropicPayload, false);
   assert.deepEqual(anthropicPayload.messages, [{ role: 'user', content: 'prompt' }]);
+});
+
+test('关闭内置思考时保留原有采样参数和 Chat token 字段', () => {
+  const responsesPayload = buildRequestPayload(
+    { mode: 'openai-responses', isOfficialOpenAiHost: true },
+    'gpt-4o-mini',
+    'prompt',
+    10000,
+    { enabled: false, effort: 'medium' }
+  ).payload;
+  const chatPayload = buildRequestPayload(
+    { mode: 'openai-chat', isOfficialOpenAiHost: false },
+    'gpt-4o-mini',
+    'prompt',
+    10000,
+    { enabled: false, effort: 'medium' }
+  ).payload;
+
+  assert.equal('reasoning' in responsesPayload, false);
+  assert.equal(responsesPayload.temperature, 0.7);
+  assert.equal('reasoning_effort' in chatPayload, false);
+  assert.equal(chatPayload.temperature, 0.7);
+  assert.equal(chatPayload.max_tokens, 10000);
+  assert.equal('max_completion_tokens' in chatPayload, false);
+});
+
+test('请求体 JSON 按模式深度覆盖并保护核心字段', () => {
+  const built = buildRequestPayload(
+    { mode: 'openai-responses', isOfficialOpenAiHost: true },
+    'gpt-4o-mini',
+    'prompt',
+    10000,
+    {
+      enabled: true,
+      effort: 'medium',
+      overrides: {
+        'openai-responses': {
+          model: 'blocked',
+          input: 'blocked',
+          reasoning: { effort: 'high' },
+          metadata: { source: 'test' }
+        },
+        anthropic: { output_config: { effort: 'low' } }
+      }
+    }
+  );
+
+  assert.equal(built.payload.model, 'gpt-4o-mini');
+  assert.ok(Array.isArray(built.payload.input));
+  assert.deepEqual(built.payload.reasoning, { effort: 'high', summary: 'auto' });
+  assert.deepEqual(built.payload.metadata, { source: 'test' });
+  assert.deepEqual(built.ignoredOverrideFields, ['model', 'input']);
+});
+
+test('Chat 流式请求仅为官方端点默认返回 usage 且允许 JSON 覆盖', () => {
+  assert.deepEqual(buildChatCompletionStreamPayload({ model: 'gpt-4o-mini' }), {
+    model: 'gpt-4o-mini',
+    stream: true
+  });
+  assert.deepEqual(buildChatCompletionStreamPayload({ model: 'gpt-4o-mini' }, true), {
+    model: 'gpt-4o-mini',
+    stream_options: { include_usage: true },
+    stream: true
+  });
+  assert.deepEqual(buildChatCompletionStreamPayload({
+    model: 'gpt-4o-mini',
+    stream_options: { include_usage: false, custom: true }
+  }, true), {
+    model: 'gpt-4o-mini',
+    stream_options: { include_usage: false, custom: true },
+    stream: true
+  });
+});
+
+test('请求体覆盖以数组和基础类型替换现有值', () => {
+  const built = mergeRequestBodyOverrides(
+    { metadata: { tags: ['old'], nested: { keep: true } }, temperature: 0.7 },
+    { metadata: { tags: ['new'], nested: { added: true } }, temperature: null }
+  );
+
+  assert.deepEqual(built.payload.metadata, {
+    tags: ['new'],
+    nested: { keep: true, added: true }
+  });
+  assert.equal(built.payload.temperature, null);
+});
+
+test('仅思考字段不兼容时允许降级，无效等级保持报错', () => {
+  assert.equal(
+    shouldFallbackThinkingRequest('openai-chat', 400, 'Unknown parameter: reasoning_effort'),
+    true
+  );
+  assert.equal(
+    shouldFallbackThinkingRequest('anthropic', 400, 'adaptive thinking is not supported on this model'),
+    true
+  );
+  assert.equal(
+    shouldFallbackThinkingRequest('openai-responses', 400, 'Invalid value for reasoning effort'),
+    false
+  );
+  assert.equal(
+    shouldFallbackThinkingRequest(
+      'openai-chat',
+      400,
+      "Unsupported value: 'high' is not supported for reasoning_effort"
+    ),
+    false
+  );
+  assert.equal(
+    shouldFallbackThinkingRequest(
+      'openai-responses',
+      400,
+      'output_config.effort high is not supported for this model'
+    ),
+    false
+  );
+  assert.equal(
+    shouldFallbackThinkingRequest('openai-chat', 400, 'reasoning_effort high is not supported'),
+    false
+  );
+  assert.equal(
+    shouldFallbackThinkingRequest('openai-chat', 500, 'Unknown parameter: reasoning_effort'),
+    false
+  );
+});
+
+test('并发请求共享首次思考能力探测并缓存降级结果', async () => {
+  const state = {
+    supportByKey: new Map<string, boolean>(),
+    probeByKey: new Map<string, Promise<boolean>>()
+  };
+  let resolveProbeRequest: (() => void) | undefined;
+  let thinkingRequests = 0;
+  let fallbackRequests = 0;
+  const request = async (thinkingEnabled: boolean): Promise<string> => {
+    if (!thinkingEnabled) {
+      fallbackRequests += 1;
+      return 'fallback';
+    }
+
+    thinkingRequests += 1;
+    if (thinkingRequests === 1) {
+      await new Promise<void>((resolve) => {
+        resolveProbeRequest = resolve;
+      });
+      throw new Error('unsupported thinking');
+    }
+    return 'thinking';
+  };
+  const run = () => requestWithThinkingFallback(
+    state,
+    'openai-chat:model',
+    request,
+    (error) => error instanceof Error && error.message.includes('unsupported'),
+    () => undefined
+  );
+
+  const first = run();
+  const second = run();
+  await Promise.resolve();
+  assert.equal(thinkingRequests, 1);
+  resolveProbeRequest?.();
+  assert.deepEqual(await Promise.all([first, second]), ['fallback', 'fallback']);
+  assert.equal(thinkingRequests, 1);
+  assert.equal(fallbackRequests, 2);
+  assert.equal(await run(), 'fallback');
+  assert.equal(fallbackRequests, 3);
+});
+
+test('持久日志响应预览过滤 JSON 和流式思考内容', () => {
+  const jsonPreview = sanitizeThinkingResponseText(JSON.stringify({
+    choices: [{ message: { reasoning_content: 'private thinking', content: 'answer' } }]
+  }));
+  const streamPreview = sanitizeThinkingResponseText([
+    'data: {"choices":[{"delta":{"reasoning_content":"private stream thinking"}}]}',
+    'data: {"choices":[{"delta":{"content":"answer"}}]}',
+    'data: [DONE]'
+  ].join('\n'));
+
+  assert.doesNotMatch(jsonPreview, /private thinking/);
+  assert.match(jsonPreview, /answer/);
+  assert.doesNotMatch(streamPreview, /private stream thinking/);
+  assert.match(streamPreview, /answer/);
 });
 
 test('接口模式兼容旧值并拒绝未知值', () => {
@@ -425,20 +627,66 @@ test('OpenAI 与 Anthropic 使用各自标准鉴权头', () => {
 });
 
 test('Anthropic 非流式响应仅拼接文本内容块', () => {
-  const text = extractAnthropicResponseText({
+  const response = {
     id: 'msg_1',
     type: 'message',
     role: 'assistant',
     model: 'claude-sonnet-4-5',
     content: [
-      { type: 'thinking' },
+      { type: 'thinking', thinking: 'analysis' },
       { type: 'text', text: 'first' },
       { type: 'tool_use' },
       { type: 'text', text: 'second' }
     ]
-  });
+  };
+  const text = extractAnthropicResponseText(response);
 
   assert.equal(text, 'first\nsecond');
+  assert.equal(extractAnthropicResponseThinking(response), 'analysis');
+});
+
+test('三种 API 模式从标准字段提取思考摘要和 token', () => {
+  const chatResponse = {
+    choices: [{ message: { reasoning_content: 'chat thinking', content: 'answer' } }],
+    usage: { completion_tokens_details: { reasoning_tokens: 12 } }
+  };
+  const responsesResponse = {
+    output: [
+      { type: 'reasoning', summary: [{ type: 'summary_text', text: 'responses thinking' }] },
+      { type: 'message', content: [{ type: 'output_text', text: 'answer' }] }
+    ],
+    usage: { output_tokens_details: { reasoning_tokens: 18 } }
+  };
+  const anthropicResponse = {
+    content: [
+      { type: 'thinking', thinking: 'anthropic thinking' },
+      { type: 'text', text: 'answer' }
+    ],
+    usage: { input_tokens: 10, output_tokens: 24 }
+  };
+
+  assert.equal(extractResponseThinking('openai-chat', chatResponse), 'chat thinking');
+  assert.equal(extractResponseReasoningTokens('openai-chat', chatResponse), 12);
+  assert.equal(extractResponseThinking('openai-responses', responsesResponse), 'responses thinking');
+  assert.equal(extractResponseReasoningTokens('openai-responses', responsesResponse), 18);
+  assert.equal(extractResponseThinking('anthropic', anthropicResponse), 'anthropic thinking');
+  assert.equal(extractResponseReasoningTokens('anthropic', anthropicResponse), undefined);
+});
+
+test('OpenAI Chat 流式响应分别拼接正文和思考内容', () => {
+  const result = extractChatCompletionStreamText([
+    'data: {"choices":[{"delta":{"reasoning_content":"think\\n"}}]}',
+    'data: {bad json}',
+    'data: {"choices":[{"delta":{"reasoning_content":"more"}}]}',
+    'data: {"choices":[{"delta":{"content":"first\\n"}}]}',
+    'data: {"choices":[{"delta":{"content":"second"}}]}',
+    'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":8,"total_tokens":13,"completion_tokens_details":{"reasoning_tokens":3}}}',
+    'data: [DONE]'
+  ].join('\n'));
+
+  assert.equal(result.text, 'first\nsecond');
+  assert.equal(result.thinking, 'think\nmore');
+  assert.equal(result.usage?.completion_tokens_details?.reasoning_tokens, 3);
 });
 
 test('Anthropic 流式响应拼接文本并合并累计用量', () => {
@@ -449,7 +697,8 @@ test('Anthropic 流式响应拼接文本并合并累计用量', () => {
     'data: {bad json}',
     'event: content_block_delta',
     'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"first\\n"}}',
-    'data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"ignored"}}',
+    'data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"think\\n"}}',
+    'data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"more"}}',
     'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"second"}}',
     'event: message_delta',
     'data: {"type":"message_delta","usage":{"output_tokens":8}}',
@@ -458,7 +707,11 @@ test('Anthropic 流式响应拼接文本并合并累计用量', () => {
   ].join('\n'));
 
   assert.equal(result.text, 'first\nsecond');
-  assert.deepEqual(result.usage, { input_tokens: 12, output_tokens: 8 });
+  assert.equal(result.thinking, 'think\nmore');
+  assert.deepEqual(result.usage, {
+    input_tokens: 12,
+    output_tokens: 8
+  });
 });
 
 test('Anthropic 流式响应在部分文本后报错时拒绝返回部分结果', () => {

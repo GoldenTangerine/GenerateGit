@@ -23,14 +23,24 @@ import {
   AnthropicStreamResult,
   AnthropicUsage,
   ApiMode,
+  buildChatCompletionStreamPayload,
   buildRequestHeaders,
   buildRequestPayload,
+  ChatCompletionStreamResult,
   extractAnthropicResponseText,
   extractAnthropicStreamText,
+  extractChatCompletionStreamText,
+  extractResponseReasoningTokens,
+  extractResponseThinking,
   normalizeApiMode,
+  RequestBodyOverrides,
+  requestWithThinkingFallback,
   ResolvedApiMode,
   ResolvedApiTarget,
-  resolveApiTarget as resolveApiTargetValue
+  resolveApiTarget as resolveApiTargetValue,
+  sanitizeThinkingResponseText,
+  shouldFallbackThinkingRequest,
+  ThinkingSupportState
 } from '../utils/requestPayload';
 import {
   buildChangeLines,
@@ -67,6 +77,8 @@ const DEFAULT_DIFF_CONCURRENCY = 1;
 const MAX_DIFF_CONCURRENCY = 10;
 const DEFAULT_MERGE_RETRY_COUNT = 5;
 const DEFAULT_MAX_OUTPUT_TOKENS = 10000;
+const DEFAULT_THINKING_ENABLED = true;
+const DEFAULT_THINKING_EFFORT = 'medium';
 const MAX_MERGE_ROUNDS = 20;
 const RESPONSE_BODY_READ_TIMEOUT_MS = 1200;
 const RESPONSE_BODY_MAX_CHARS = 4000;
@@ -103,6 +115,9 @@ interface ChatCompletionResponse {
     prompt_tokens: number;
     completion_tokens: number;
     total_tokens: number;
+    completion_tokens_details?: {
+      reasoning_tokens?: number;
+    };
   };
 }
 
@@ -115,6 +130,10 @@ interface ResponsesApiResponse {
   output?: Array<{
     type: string;
     role?: string;
+    summary?: Array<{
+      type: string;
+      text?: string;
+    }>;
     content?: Array<{
       type: string;
       text?: string;
@@ -126,6 +145,9 @@ interface ResponsesApiResponse {
     total_tokens?: number;
     prompt_tokens?: number;
     completion_tokens?: number;
+    output_tokens_details?: {
+      reasoning_tokens?: number;
+    };
   };
 }
 
@@ -137,6 +159,11 @@ interface GenerateCommitConfig {
   model: string;
   apiMode: ApiMode;
   chatCompletionsDelivery: ChatCompletionsDelivery;
+  thinkingEnabled: boolean;
+  thinkingEffort: string;
+  requestBodyOverrides: RequestBodyOverrides;
+  thinkingSupport: ThinkingSupportState;
+  loggedIgnoredOverrideFields: Set<string>;
   customPrompt: string;
   outputTemplate: string;
   titleLengthRange: TitleLengthRange;
@@ -161,9 +188,16 @@ interface ResponseErrorDetails {
   requestId?: string;
 }
 
-interface ChatCompletionStreamResult {
+interface ApiRequestError extends Error {
+  status: number;
+  responseDetails: ResponseErrorDetails;
+}
+
+interface AiMessageResult {
   text: string;
-  usage?: ChatCompletionResponse['usage'];
+  thinking?: string;
+  reasoningTokens?: number;
+  usageData?: ApiResponse;
 }
 
 /**
@@ -177,6 +211,14 @@ function getConfig(): GenerateCommitConfig {
     model: config.get<string>('model') || DEFAULT_MODEL,
     apiMode: resolveApiMode(config.get<string>('apiMode')),
     chatCompletionsDelivery: resolveChatCompletionsDelivery(config.get<string>('chatCompletionsDelivery')),
+    thinkingEnabled: config.get<boolean>('thinkingEnabled') ?? DEFAULT_THINKING_ENABLED,
+    thinkingEffort: config.get<string>('thinkingEffort')?.trim() || DEFAULT_THINKING_EFFORT,
+    requestBodyOverrides: resolveRequestBodyOverrides(config.get<unknown>('requestBodyOverrides')),
+    thinkingSupport: {
+      supportByKey: new Map<string, boolean>(),
+      probeByKey: new Map<string, Promise<boolean>>()
+    },
+    loggedIgnoredOverrideFields: new Set<string>(),
     customPrompt: config.get<string>('customPrompt') || '',
     outputTemplate: config.get<string>('outputTemplate') || '',
     titleLengthRange: resolveTitleLengthRange(config.get<string>('titleLengthRange')),
@@ -196,6 +238,32 @@ function getConfig(): GenerateCommitConfig {
     requestTimeoutMs: resolveTimeoutMs(config.get<number>('requestTimeoutMs')),
     retryStatusCodes: resolveRetryStatusCodes(config.get<number[]>('retryStatusCodes'))
   };
+}
+
+function resolveRequestBodyOverrides(value: unknown): RequestBodyOverrides {
+  if (value === undefined || value === null) {
+    return {};
+  }
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    logger.warn('requestBodyOverrides 必须是对象，已忽略当前配置');
+    return {};
+  }
+
+  const modes: ResolvedApiMode[] = ['anthropic', 'openai-chat', 'openai-responses'];
+  const record = value as Record<string, unknown>;
+  const overrides: RequestBodyOverrides = {};
+  modes.forEach((mode) => {
+    const modeValue = record[mode];
+    if (modeValue === undefined) {
+      return;
+    }
+    if (!modeValue || typeof modeValue !== 'object' || Array.isArray(modeValue)) {
+      logger.warn(`requestBodyOverrides.${mode} 必须是对象，已忽略该模式配置`);
+      return;
+    }
+    overrides[mode] = modeValue;
+  });
+  return overrides;
 }
 
 /**
@@ -495,6 +563,18 @@ function extractResponsesText(data: ResponsesApiResponse): string {
   return messageText;
 }
 
+function extractReasoningTokens(data: ApiResponse | undefined): number | undefined {
+  if (!data) {
+    return undefined;
+  }
+  const mode: ResolvedApiMode = 'choices' in data
+    ? 'openai-chat'
+    : ('output' in data || 'output_text' in data)
+      ? 'openai-responses'
+      : 'anthropic';
+  return extractResponseReasoningTokens(mode, data);
+}
+
 function tryExtractText(
   extractor: (data: unknown) => string,
   data: unknown
@@ -558,9 +638,6 @@ function buildExtractionFailureFields(
       { label: 'choices 数量', value: Array.isArray(data.choices) ? data.choices.length : 0 },
       { label: 'finish_reason', value: readStringField(firstChoice, 'finish_reason') || '未知' },
       { label: 'content 类型', value: describeValueShape(message?.content) },
-      message && typeof message.reasoning_content === 'string' && message.reasoning_content.trim()
-        ? { label: 'reasoning 摘要', value: compactText(message.reasoning_content, RESPONSE_SUMMARY_MAX_CHARS) }
-        : undefined,
       message && typeof message.refusal === 'string' && message.refusal.trim()
         ? { label: 'refusal', value: compactText(message.refusal, RESPONSE_SUMMARY_MAX_CHARS) }
         : undefined,
@@ -586,7 +663,7 @@ function buildExtractionFailureFields(
 
 function buildSuccessfulResponsePreview(data: ApiResponse): string {
   try {
-    return compactText(JSON.stringify(data), RESPONSE_PREVIEW_MAX_CHARS);
+    return compactText(sanitizeThinkingResponseText(JSON.stringify(data)), RESPONSE_PREVIEW_MAX_CHARS);
   } catch {
     return '[响应对象无法序列化]';
   }
@@ -666,7 +743,11 @@ async function requestJsonApiData(
         { label: '接口模式', value: apiTarget.mode },
         { label: '模型', value: model }
       ]));
-      throw new Error(buildHttpErrorMessage(response.status, response.statusText, apiTarget));
+      throw createApiRequestError(
+        buildHttpErrorMessage(response.status, response.statusText, apiTarget),
+        response.status,
+        responseDetails
+      );
     }
 
     const contentType = response.headers.get('content-type') || '';
@@ -676,7 +757,10 @@ async function requestJsonApiData(
       logger.errorBlock('API 响应格式异常', [
         { label: '响应类型', value: contentType || '未知' },
         { label: '接口地址', value: apiTarget.endpoint },
-        { label: '响应预览', value: compactText(preview, 200) || '响应体为空' }
+        {
+          label: '响应预览',
+          value: compactText(sanitizeThinkingResponseText(preview), 200) || '响应体为空'
+        }
       ]);
 
       if (bodyPreview.trimStart().startsWith('<') || contentType.includes('text/html')) {
@@ -699,22 +783,28 @@ async function resolveChatCompletionsMessage(
   config: GenerateCommitConfig,
   requestPayload: Record<string, unknown>,
   requestOptions: RequestWithRetryOptions
-): Promise<{ text: string; usageData?: ApiResponse }> {
+): Promise<AiMessageResult> {
   if (config.chatCompletionsDelivery === 'stream-first') {
     try {
       const streamResult = await requestChatCompletionTextFromStream(
         apiTarget.endpoint,
         config.apiKey,
         requestPayload,
+        apiTarget.isOfficialOpenAiHost,
         requestOptions
       );
       return {
         text: streamResult.text,
+        thinking: streamResult.thinking,
+        reasoningTokens: streamResult.usage?.completion_tokens_details?.reasoning_tokens,
         usageData: createChatCompletionUsageEnvelope(config.model, streamResult.usage)
       };
     } catch (error) {
       if (requestOptions.signal?.aborted) {
         throw createAbortError();
+      }
+      if (isThinkingParameterUnsupportedError(error, apiTarget.mode)) {
+        throw error;
       }
       logger.warnBlock('优先流式解析失败，准备回退到非流式请求', [
         { label: '接口地址', value: apiTarget.endpoint },
@@ -735,16 +825,21 @@ async function resolveChatCompletionsMessage(
       apiTarget.endpoint,
       config.apiKey,
       requestPayload,
+      apiTarget.isOfficialOpenAiHost,
       requestOptions
     );
     return {
       text: streamResult.text,
+      thinking: streamResult.thinking,
+      reasoningTokens: streamResult.usage?.completion_tokens_details?.reasoning_tokens,
       usageData: createChatCompletionUsageEnvelope(config.model, streamResult.usage) || data
     };
   }
 
   return {
     text: extractGeneratedText(apiTarget.mode, data),
+    thinking: extractResponseThinking('openai-chat', data),
+    reasoningTokens: extractReasoningTokens(data),
     usageData: data
   };
 }
@@ -754,7 +849,7 @@ async function resolveAnthropicMessage(
   config: GenerateCommitConfig,
   requestPayload: Record<string, unknown>,
   requestOptions: RequestWithRetryOptions
-): Promise<{ text: string; usageData?: ApiResponse }> {
+): Promise<AiMessageResult> {
   if (config.chatCompletionsDelivery === 'stream-first') {
     try {
       const streamResult = await requestAnthropicTextFromStream(
@@ -765,11 +860,15 @@ async function resolveAnthropicMessage(
       );
       return {
         text: streamResult.text,
+        thinking: streamResult.thinking,
         usageData: createAnthropicUsageEnvelope(config.model, streamResult.usage)
       };
     } catch (error) {
       if (requestOptions.signal?.aborted) {
         throw createAbortError();
+      }
+      if (isThinkingParameterUnsupportedError(error, apiTarget.mode)) {
+        throw error;
       }
       logger.warnBlock('Anthropic 优先流式解析失败，准备回退到非流式请求', [
         { label: '接口地址', value: apiTarget.endpoint },
@@ -797,12 +896,15 @@ async function resolveAnthropicMessage(
     );
     return {
       text: streamResult.text,
+      thinking: streamResult.thinking,
       usageData: createAnthropicUsageEnvelope(config.model, streamResult.usage) || data
     };
   }
 
   return {
     text: extractGeneratedText(apiTarget.mode, data),
+    thinking: extractResponseThinking('anthropic', data),
+    reasoningTokens: extractReasoningTokens(data),
     usageData: data
   };
 }
@@ -826,7 +928,7 @@ async function requestAnthropicTextFromStream(
       logger.errorBlock('Anthropic 流式请求失败', buildResponseLogFields(response, responseDetails, [
         { label: '接口地址', value: endpoint }
       ]));
-      throw new Error(buildStatusLabel(response));
+      throw createApiRequestError(buildStatusLabel(response), response.status, responseDetails);
     }
 
     const rawStream = await response.text();
@@ -837,7 +939,10 @@ async function requestAnthropicTextFromStream(
 
     logger.errorBlock('Anthropic 流式响应未提取到正文', [
       { label: '接口地址', value: endpoint },
-      { label: '响应预览', value: compactText(rawStream, RESPONSE_PREVIEW_MAX_CHARS) || '响应体为空' }
+      {
+        label: '响应预览',
+        value: compactText(sanitizeThinkingResponseText(rawStream), RESPONSE_PREVIEW_MAX_CHARS) || '响应体为空'
+      }
     ]);
     throw new Error('Anthropic 流式响应中未包含可用文本');
   });
@@ -847,22 +952,20 @@ async function requestChatCompletionTextFromStream(
   endpoint: string,
   apiKey: string,
   payload: Record<string, unknown>,
+  includeUsage: boolean,
   options: RequestWithRetryOptions
 ): Promise<ChatCompletionStreamResult> {
   return requestWithRetry(endpoint, {
     method: 'POST',
     headers: buildRequestHeaders('openai-chat', apiKey, true),
-    body: JSON.stringify({
-      ...payload,
-      stream: true
-    })
+    body: JSON.stringify(buildChatCompletionStreamPayload(payload, includeUsage))
   }, options, async (response) => {
     if (!response.ok) {
       const responseDetails = await extractResponseErrorDetails(response);
       logger.errorBlock('流式回退请求失败', buildResponseLogFields(response, responseDetails, [
         { label: '接口地址', value: endpoint }
       ]));
-      throw new Error(buildStatusLabel(response));
+      throw createApiRequestError(buildStatusLabel(response), response.status, responseDetails);
     }
 
     const rawStream = await response.text();
@@ -873,61 +976,13 @@ async function requestChatCompletionTextFromStream(
 
     logger.errorBlock('流式回退未提取到正文', [
       { label: '接口地址', value: endpoint },
-      { label: '响应预览', value: compactText(rawStream, RESPONSE_PREVIEW_MAX_CHARS) || '响应体为空' }
+      {
+        label: '响应预览',
+        value: compactText(sanitizeThinkingResponseText(rawStream), RESPONSE_PREVIEW_MAX_CHARS) || '响应体为空'
+      }
     ]);
     throw new Error('API 流式响应中未包含可用文本');
   });
-}
-
-function extractChatCompletionStreamText(rawStream: string): ChatCompletionStreamResult {
-  const fragments: string[] = [];
-  let usage: ChatCompletionResponse['usage'] | undefined;
-
-  rawStream.split(/\r?\n/).forEach((line) => {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith('data:')) {
-      return;
-    }
-
-    const payload = trimmed.slice(5).trim();
-    if (!payload || payload === '[DONE]') {
-      return;
-    }
-
-    try {
-      const parsed = JSON.parse(payload) as Record<string, unknown>;
-      const choices = Array.isArray(parsed.choices) ? parsed.choices as Array<Record<string, unknown>> : [];
-      const parsedUsage = parsed.usage as ChatCompletionResponse['usage'] | undefined;
-      if (parsedUsage) {
-        usage = parsedUsage;
-      }
-      choices.forEach((choice) => {
-        const delta = choice.delta as Record<string, unknown> | undefined;
-        // 流式 delta 需直接取字符串，不做 trim，否则单独的 "\n" chunk 会被清除
-        if (typeof delta?.content === 'string') {
-          fragments.push(delta.content);
-          return;
-        }
-
-        const message = choice.message as Record<string, unknown> | undefined;
-        if (typeof message?.content === 'string') {
-          fragments.push(message.content);
-          return;
-        }
-
-        if (typeof choice.text === 'string') {
-          fragments.push(choice.text);
-        }
-      });
-    } catch {
-      // ignore malformed stream chunks and continue collecting usable deltas
-    }
-  });
-
-  return {
-    text: fragments.join('').trim(),
-    usage
-  };
 }
 
 function logUsage(mode: ResolvedApiMode, data: ApiResponse): void {
@@ -964,6 +1019,35 @@ function logUsage(mode: ResolvedApiMode, data: ApiResponse): void {
     { label: 'completion', value: usage?.completion_tokens ?? '-' },
     { label: 'total', value: usage?.total_tokens ?? '-' }
   ]);
+}
+
+function createApiRequestError(
+  message: string,
+  status: number,
+  responseDetails: ResponseErrorDetails
+): ApiRequestError {
+  const error = new Error(message) as ApiRequestError;
+  error.name = 'ApiRequestError';
+  error.status = status;
+  error.responseDetails = responseDetails;
+  return error;
+}
+
+function isApiRequestError(error: unknown): error is ApiRequestError {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const requestError = error as Partial<ApiRequestError>;
+  return typeof requestError.status === 'number' && Boolean(requestError.responseDetails);
+}
+
+function isThinkingParameterUnsupportedError(error: unknown, mode: ResolvedApiMode): boolean {
+  if (!isApiRequestError(error) || (error.status !== 400 && error.status !== 422)) {
+    return false;
+  }
+
+  const details = `${error.message} ${error.responseDetails.summary} ${error.responseDetails.preview || ''}`.toLowerCase();
+  return shouldFallbackThinkingRequest(mode, error.status, details);
 }
 
 function buildHttpErrorMessage(status: number, statusText: string, apiTarget: ResolvedApiTarget): string {
@@ -1086,7 +1170,7 @@ function summarizeResponseBody(bodyText: string | undefined, contentType?: strin
     return htmlText ? `HTML 响应: ${htmlText}` : 'HTML 响应内容为空';
   }
 
-  return compactText(bodyText, RESPONSE_SUMMARY_MAX_CHARS);
+  return compactText(sanitizeThinkingResponseText(bodyText), RESPONSE_SUMMARY_MAX_CHARS);
 }
 
 function buildResponsePreview(bodyText: string | undefined): string | undefined {
@@ -1094,7 +1178,7 @@ function buildResponsePreview(bodyText: string | undefined): string | undefined 
     return undefined;
   }
 
-  return compactText(bodyText, RESPONSE_PREVIEW_MAX_CHARS);
+  return compactText(sanitizeThinkingResponseText(bodyText), RESPONSE_PREVIEW_MAX_CHARS);
 }
 
 function extractJsonErrorMessage(text: string): string | undefined {
@@ -1330,6 +1414,7 @@ export async function generateCommitMessage(diff: string, signal?: AbortSignal):
     throw createAbortError();
   }
   const config = getConfig();
+  logger.clearThinkingOutput();
   const apiTarget = resolveApiTarget(config.apiEndpoint, config.apiMode);
   if (apiTarget.endpoint !== config.apiEndpoint) {
     logger.info(`API 端点已规范化: ${config.apiEndpoint} -> ${apiTarget.endpoint}`);
@@ -1371,6 +1456,11 @@ export async function generateCommitMessage(diff: string, signal?: AbortSignal):
     { label: '接口地址', value: apiTarget.endpoint },
     { label: '接口模式', value: apiTarget.mode },
     { label: '模型', value: config.model },
+    { label: '内置思考', value: config.thinkingEnabled ? '开启' : '关闭' },
+    config.thinkingEnabled ? { label: '思考强度', value: config.thinkingEffort } : undefined,
+    config.requestBodyOverrides[apiTarget.mode]
+      ? { label: '请求字段覆盖', value: apiTarget.mode }
+      : undefined,
     config.customPrompt
       ? { label: 'Prompt 规则', value: '自定义 Prompt 优先' }
       : { label: '标题/描述长度', value: `${config.titleLengthRange} / ${config.descriptionLengthRange}` },
@@ -1503,8 +1593,76 @@ async function requestAiMessage(
   model: string,
   prompt: string,
   requestOptions: RequestWithRetryOptions
-): Promise<{ text: string; usageData?: ApiResponse }> {
-  const requestPayload = buildRequestPayload(apiTarget, model, prompt, config.maxOutputTokens);
+): Promise<AiMessageResult> {
+  const fallbackKey = `${apiTarget.mode}:${model}`;
+  if (!config.thinkingEnabled) {
+    const requestPayload = buildConfiguredRequestPayload(apiTarget, config, model, prompt, false);
+    return requestAiMessageWithPayload(apiTarget, config, model, requestPayload, requestOptions);
+  }
+
+  const payloadBySupport = new Map<boolean, Record<string, unknown>>();
+  const getPayload = (thinkingEnabled: boolean): Record<string, unknown> => {
+    const cachedPayload = payloadBySupport.get(thinkingEnabled);
+    if (cachedPayload) {
+      return cachedPayload;
+    }
+    const payload = buildConfiguredRequestPayload(apiTarget, config, model, prompt, thinkingEnabled);
+    payloadBySupport.set(thinkingEnabled, payload);
+    return payload;
+  };
+
+  return requestWithThinkingFallback(
+    config.thinkingSupport,
+    fallbackKey,
+    (thinkingEnabled) => requestAiMessageWithPayload(
+      apiTarget,
+      config,
+      model,
+      getPayload(thinkingEnabled),
+      requestOptions
+    ),
+    (error) => isThinkingParameterUnsupportedError(error, apiTarget.mode)
+      && JSON.stringify(getPayload(true)) !== JSON.stringify(getPayload(false)),
+    (error) => {
+      logger.warnBlock('思考参数不受支持，已关闭内置思考并重试', [
+        { label: '接口模式', value: apiTarget.mode },
+        { label: '模型', value: model },
+        { label: '错误信息', value: getErrorMessage(error) }
+      ]);
+    }
+  );
+}
+
+function buildConfiguredRequestPayload(
+  apiTarget: ResolvedApiTarget,
+  config: GenerateCommitConfig,
+  model: string,
+  prompt: string,
+  thinkingEnabled: boolean
+): Record<string, unknown> {
+  const built = buildRequestPayload(apiTarget, model, prompt, config.maxOutputTokens, {
+    enabled: thinkingEnabled,
+    effort: config.thinkingEffort,
+    overrides: config.requestBodyOverrides
+  });
+  built.ignoredOverrideFields.forEach((field) => {
+    const warningKey = `${apiTarget.mode}.${field}`;
+    if (config.loggedIgnoredOverrideFields.has(warningKey)) {
+      return;
+    }
+    config.loggedIgnoredOverrideFields.add(warningKey);
+    logger.warn(`requestBodyOverrides.${warningKey} 为受保护字段，已忽略`);
+  });
+  return built.payload;
+}
+
+async function requestAiMessageWithPayload(
+  apiTarget: ResolvedApiTarget,
+  config: GenerateCommitConfig,
+  model: string,
+  requestPayload: Record<string, unknown>,
+  requestOptions: RequestWithRetryOptions
+): Promise<AiMessageResult> {
   if (apiTarget.mode === 'openai-chat') {
     return resolveChatCompletionsMessage(
       apiTarget,
@@ -1526,6 +1684,8 @@ async function requestAiMessage(
   const data = await requestJsonApiData(apiTarget, config.apiKey, model, requestPayload, requestOptions);
   return {
     text: extractGeneratedText(apiTarget.mode, data),
+    thinking: extractResponseThinking('openai-responses', data),
+    reasoningTokens: extractReasoningTokens(data),
     usageData: data
   };
 }
@@ -1541,10 +1701,23 @@ async function requestValidatedAiMessage(
   files: string[],
   requestOptions: RequestWithRetryOptions,
   contextLabel: string
-): Promise<{ text: string; usageData?: ApiResponse }> {
+): Promise<AiMessageResult> {
   try {
     return await retryAsyncTask(async () => {
       const result = await requestAiMessage(apiTarget, config, model, prompt, requestOptions);
+      if (
+        config.thinkingEnabled
+        || Boolean(result.thinking)
+        || (typeof result.reasoningTokens === 'number' && result.reasoningTokens > 0)
+      ) {
+        logger.printThinkingOutput(
+          contextLabel,
+          apiTarget.mode,
+          model,
+          result.thinking,
+          result.reasoningTokens
+        );
+      }
       const cleanedText = cleanMarkdownCodeBlock(result.text);
       const validation = validateCommitMessage(cleanedText, files);
       if (!validation.valid) {
