@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.3.2 - 2026-07-31
+
+### Added
+- 新增 Anthropic Messages API，支持标准 JSON 与 SSE 流式响应
+- `apiMode` 新增 `anthropic`、`openai-chat`、`openai-responses` 三种显式接口模式
+
+### Changed
+- `chatCompletionsDelivery` 同时控制 Anthropic 与 OpenAI Chat 的流式、非流式优先级
+- 旧配置值 `chat-completions`、`responses` 自动映射到对应的新模式名称
+
+### Fixed
+- 修复 Anthropic SSE 报错或提前中断时可能误用部分输出的问题
+
 ## v1.3.1 - 2026-07-31
 
 ### Added

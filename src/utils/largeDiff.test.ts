@@ -24,7 +24,15 @@ import {
 import { extractChangedFilePaths } from './diff';
 import { buildMergePrompt, buildPrompt, getDefaultMergePrompt, getDefaultPrompt } from './prompt';
 import { buildOutputTemplatePreview, DEFAULT_OUTPUT_TEMPLATE } from './outputTemplate';
-import { buildRequestPayload } from './requestPayload';
+import {
+  ANTHROPIC_API_VERSION,
+  buildRequestHeaders,
+  buildRequestPayload,
+  extractAnthropicResponseText,
+  extractAnthropicStreamText,
+  normalizeApiMode,
+  resolveApiTarget
+} from './requestPayload';
 
 test('未超限的 diff 保持为单段', () => {
   const diff = buildDiff('src/a.ts', '+const value = 1;\n');
@@ -336,16 +344,22 @@ test('默认输出模板使用变更内容和分类标签', () => {
   assert.doesNotMatch(preview, /\[新增\|修改\|删除\|重命名\]/);
 });
 
-test('请求负载为两种 API 模式设置最大输出 token', () => {
+test('请求负载为三种 API 模式设置最大输出 token', () => {
   const responsesPayload = buildRequestPayload(
-    { mode: 'responses', isOfficialOpenAiHost: true },
+    { mode: 'openai-responses', isOfficialOpenAiHost: true },
     'gpt-4o-mini',
     'prompt',
     10000
   );
   const chatPayload = buildRequestPayload(
-    { mode: 'chat-completions', isOfficialOpenAiHost: false },
+    { mode: 'openai-chat', isOfficialOpenAiHost: false },
     'gpt-4o-mini',
+    'prompt',
+    10000
+  );
+  const anthropicPayload = buildRequestPayload(
+    { mode: 'anthropic', isOfficialOpenAiHost: false },
+    'claude-sonnet-4-5',
     'prompt',
     10000
   );
@@ -354,6 +368,112 @@ test('请求负载为两种 API 模式设置最大输出 token', () => {
   assert.equal(responsesPayload.store, false);
   assert.equal(chatPayload.max_tokens, 10000);
   assert.equal('store' in chatPayload, false);
+  assert.equal(anthropicPayload.max_tokens, 10000);
+  assert.equal('store' in anthropicPayload, false);
+  assert.deepEqual(anthropicPayload.messages, [{ role: 'user', content: 'prompt' }]);
+});
+
+test('接口模式兼容旧值并拒绝未知值', () => {
+  assert.equal(normalizeApiMode('auto'), 'auto');
+  assert.equal(normalizeApiMode('anthropic'), 'anthropic');
+  assert.equal(normalizeApiMode('openai-chat'), 'openai-chat');
+  assert.equal(normalizeApiMode('openai-responses'), 'openai-responses');
+  assert.equal(normalizeApiMode('chat-completions'), 'openai-chat');
+  assert.equal(normalizeApiMode('responses'), 'openai-responses');
+  assert.equal(normalizeApiMode('unknown'), undefined);
+});
+
+test('auto 保持原有 OpenAI 路由且不自动识别 Anthropic', () => {
+  assert.equal(resolveApiTarget('https://api.openai.com/v1', 'auto').mode, 'openai-responses');
+  assert.equal(
+    resolveApiTarget('https://api.openai.com/v1', 'auto').endpoint,
+    'https://api.openai.com/v1/responses'
+  );
+  assert.equal(resolveApiTarget('https://example.com/v1', 'auto').mode, 'openai-chat');
+  assert.equal(
+    resolveApiTarget('https://example.com/v1/messages', 'auto').mode,
+    'openai-chat'
+  );
+});
+
+test('显式模式补全或替换对应端点路径', () => {
+  assert.equal(
+    resolveApiTarget('https://api.anthropic.com', 'anthropic').endpoint,
+    'https://api.anthropic.com/v1/messages'
+  );
+  assert.equal(
+    resolveApiTarget('https://example.com/v1/chat/completions', 'anthropic').endpoint,
+    'https://example.com/v1/messages'
+  );
+  assert.equal(
+    resolveApiTarget('https://example.com/v1/messages', 'openai-responses').endpoint,
+    'https://example.com/v1/responses'
+  );
+});
+
+test('OpenAI 与 Anthropic 使用各自标准鉴权头', () => {
+  assert.deepEqual(buildRequestHeaders('openai-chat', 'openai-key', true), {
+    'Content-Type': 'application/json',
+    'Authorization': 'Bearer openai-key',
+    'Accept': 'text/event-stream'
+  });
+  assert.deepEqual(buildRequestHeaders('anthropic', 'anthropic-key'), {
+    'Content-Type': 'application/json',
+    'x-api-key': 'anthropic-key',
+    'anthropic-version': ANTHROPIC_API_VERSION
+  });
+});
+
+test('Anthropic 非流式响应仅拼接文本内容块', () => {
+  const text = extractAnthropicResponseText({
+    id: 'msg_1',
+    type: 'message',
+    role: 'assistant',
+    model: 'claude-sonnet-4-5',
+    content: [
+      { type: 'thinking' },
+      { type: 'text', text: 'first' },
+      { type: 'tool_use' },
+      { type: 'text', text: 'second' }
+    ]
+  });
+
+  assert.equal(text, 'first\nsecond');
+});
+
+test('Anthropic 流式响应拼接文本并合并累计用量', () => {
+  const result = extractAnthropicStreamText([
+    'event: message_start',
+    'data: {"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":1}}}',
+    '',
+    'data: {bad json}',
+    'event: content_block_delta',
+    'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"first\\n"}}',
+    'data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"ignored"}}',
+    'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"second"}}',
+    'event: message_delta',
+    'data: {"type":"message_delta","usage":{"output_tokens":8}}',
+    'event: message_stop',
+    'data: {"type":"message_stop"}'
+  ].join('\n'));
+
+  assert.equal(result.text, 'first\nsecond');
+  assert.deepEqual(result.usage, { input_tokens: 12, output_tokens: 8 });
+});
+
+test('Anthropic 流式响应在部分文本后报错时拒绝返回部分结果', () => {
+  assert.throws(() => extractAnthropicStreamText([
+    'data: {"type":"message_start","message":{"usage":{"input_tokens":12}}}',
+    'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}',
+    'data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}'
+  ].join('\n')), /overloaded_error: Overloaded/);
+});
+
+test('Anthropic 流式响应缺少正常结束事件时拒绝返回部分结果', () => {
+  assert.throws(() => extractAnthropicStreamText([
+    'data: {"type":"message_start","message":{"usage":{"input_tokens":12}}}',
+    'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}'
+  ].join('\n')), /流式响应不完整/);
 });
 
 function assertWithinRange(length: number, range: string): void {

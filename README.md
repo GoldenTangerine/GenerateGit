@@ -5,7 +5,7 @@
 ## 功能特点
 
 - 🎯 自动分析暂存区的 diff 内容
-- 🤖 支持 OpenAI `Chat Completions` / `Responses` 及兼容 API（OpenAI、DeepSeek、智谱等）
+- 🤖 支持 Anthropic `Messages`、OpenAI `Chat Completions` / `Responses` 及兼容 API
 - 📝 生成符合 Angular 规范的提交消息
 - 😊 自动添加对应的 emoji 前缀
 - 🗂️ 支持多仓库 / monorepo 场景，优先锁定当前点击的 Git 子库
@@ -39,8 +39,8 @@ pnpm run package
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
 | `apiEndpoint` | AI API 地址，支持 base URL 或完整端点 | `https://api.openai.com/v1` |
-| `apiMode` | 接口模式：`auto` / `chat-completions` / `responses` | `auto` |
-| `chatCompletionsDelivery` | Chat Completions 正文获取策略：`non-stream-first` / `stream-first` | `non-stream-first` |
+| `apiMode` | 接口模式：`auto` / `anthropic` / `openai-chat` / `openai-responses` | `auto` |
+| `chatCompletionsDelivery` | Anthropic / OpenAI Chat 正文获取策略：`non-stream-first` / `stream-first` | `non-stream-first` |
 | `apiKey` | AI API 密钥 | - |
 | `model` | 使用的模型名称 | `gpt-4o-mini` |
 | `customPrompt` | 自定义 Diff 分析 Prompt | - |
@@ -81,6 +81,16 @@ pnpm run package
 }
 ```
 
+**使用 Anthropic：**
+```json
+{
+  "generateGitCommit.apiEndpoint": "https://api.anthropic.com",
+  "generateGitCommit.apiMode": "anthropic",
+  "generateGitCommit.apiKey": "sk-ant-xxx",
+  "generateGitCommit.model": "claude-sonnet-5"
+}
+```
+
 **使用 DeepSeek：**
 ```json
 {
@@ -95,7 +105,7 @@ pnpm run package
 ```json
 {
   "generateGitCommit.apiEndpoint": "https://api.openai.com/v1",
-  "generateGitCommit.apiMode": "responses",
+  "generateGitCommit.apiMode": "openai-responses",
   "generateGitCommit.apiKey": "sk-xxx",
   "generateGitCommit.model": "gpt-4o-mini"
 }
@@ -105,7 +115,7 @@ pnpm run package
 ```json
 {
   "generateGitCommit.apiEndpoint": "https://www.linkflow.run/v1/chat/completions",
-  "generateGitCommit.apiMode": "chat-completions",
+  "generateGitCommit.apiMode": "openai-chat",
   "generateGitCommit.chatCompletionsDelivery": "stream-first",
   "generateGitCommit.apiKey": "sk-xxx",
   "generateGitCommit.model": "gpt-5.4"
@@ -171,13 +181,15 @@ pnpm run package
 **接口选择规则：**
 - `apiMode = auto` 时，若 `apiEndpoint` 已明确写成 `/v1/chat/completions` 或 `/v1/responses`，插件直接按该端点发送请求。
 - `apiMode = auto` 且只填写 base URL（如 `https://api.openai.com/v1`）时，官方 OpenAI 默认走 `/v1/responses`，其他 OpenAI-compatible 服务默认走 `/v1/chat/completions`。
-- 如你的代理或兼容服务也支持 `responses`，但域名不是 `api.openai.com`，请显式设置 `apiMode = responses` 或直接把端点写成 `/v1/responses`。
-- 检测到官方 OpenAI 端点时，插件会自动附带 `store: false`，避免默认保存提交 diff 等请求内容。
+- Anthropic 不参与 `auto` 判断；使用 Messages API 时需显式设置 `apiMode = anthropic`，base URL 会自动补全 `/v1/messages`。
+- 如代理或兼容服务支持 Responses，但域名不是 `api.openai.com`，请显式设置 `apiMode = openai-responses` 或填写完整 `/v1/responses` 端点。
+- 旧配置值 `chat-completions`、`responses` 会自动映射为 `openai-chat`、`openai-responses`。
+- 检测到官方 OpenAI 端点且使用 OpenAI 模式时，插件会自动附带 `store: false`，避免默认保存提交 diff 等请求内容。
 
-**Chat Completions 正文获取策略：**
-- `chatCompletionsDelivery = non-stream-first` 时，插件会优先读取普通 JSON 响应；若服务端返回空壳 `assistant` 消息，再自动回退到 `stream: true`。
-- `chatCompletionsDelivery = stream-first` 时，插件会优先读取流式增量内容；若流式失败或未提取到正文，再自动回退到普通 JSON 响应。
-- 该配置仅影响 `chat/completions` 模式；`responses` 模式仍按标准 JSON 响应处理。
+**正文获取策略：**
+- `chatCompletionsDelivery = non-stream-first` 时，Anthropic 和 OpenAI Chat 优先读取普通 JSON；响应缺少正文时再回退到 `stream: true`。
+- `chatCompletionsDelivery = stream-first` 时，Anthropic 和 OpenAI Chat 优先读取流式增量内容；流式失败或无正文时再回退到普通 JSON。
+- OpenAI Responses 模式仍按标准 JSON 响应处理。
 
 **重试说明：**
 - 遇到可重试状态码时会先释放响应体，再等待后重试，避免连接占用。
@@ -236,6 +248,7 @@ pnpm run package
 
 ### API Key 在哪里获取？
 
+- Anthropic: https://console.anthropic.com/settings/keys
 - OpenAI: https://platform.openai.com/api-keys
 - DeepSeek: https://platform.deepseek.com/api_keys
 - 智谱: https://open.bigmodel.cn/usercenter/apikeys
@@ -246,7 +259,8 @@ pnpm run package
 
 ### 支持哪些 AI 服务？
 
-支持 OpenAI 官方的 `Responses API`、`Chat Completions API`，以及兼容 `Chat Completions` 的服务，包括但不限于：
+支持 Anthropic 官方的 `Messages API`、OpenAI 官方的 `Responses API`、`Chat Completions API`，以及对应兼容服务，包括但不限于：
+- Anthropic Claude
 - OpenAI (GPT-4, GPT-3.5)
 - DeepSeek
 - 智谱 GLM

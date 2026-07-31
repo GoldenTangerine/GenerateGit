@@ -18,7 +18,20 @@ import {
 import { extractChangedFilePaths } from '../utils/diff';
 import { DEFAULT_REDACT_PATTERNS, redactSensitiveText } from '../utils/redact';
 import { DEFAULT_OUTPUT_TEMPLATE, renderOutputTemplate, resolveOutputTemplate } from '../utils/outputTemplate';
-import { buildRequestPayload } from '../utils/requestPayload';
+import {
+  AnthropicApiResponse,
+  AnthropicStreamResult,
+  AnthropicUsage,
+  ApiMode,
+  buildRequestHeaders,
+  buildRequestPayload,
+  extractAnthropicResponseText,
+  extractAnthropicStreamText,
+  normalizeApiMode,
+  ResolvedApiMode,
+  ResolvedApiTarget,
+  resolveApiTarget as resolveApiTargetValue
+} from '../utils/requestPayload';
 import {
   buildChangeLines,
   createAbortError,
@@ -33,8 +46,6 @@ import {
   waitForDelay
 } from '../utils/largeDiff';
 
-type ApiMode = 'auto' | 'chat-completions' | 'responses';
-type ResolvedApiMode = Exclude<ApiMode, 'auto'>;
 type ChatCompletionsDelivery = 'non-stream-first' | 'stream-first';
 type DiffMergeMode = 'local' | 'remote';
 
@@ -57,7 +68,6 @@ const MAX_DIFF_CONCURRENCY = 10;
 const DEFAULT_MERGE_RETRY_COUNT = 5;
 const DEFAULT_MAX_OUTPUT_TOKENS = 10000;
 const MAX_MERGE_ROUNDS = 20;
-const OPENAI_API_HOSTS = new Set(['api.openai.com']);
 const RESPONSE_BODY_READ_TIMEOUT_MS = 1200;
 const RESPONSE_BODY_MAX_CHARS = 4000;
 const RESPONSE_SUMMARY_MAX_CHARS = 240;
@@ -119,6 +129,8 @@ interface ResponsesApiResponse {
   };
 }
 
+type ApiResponse = ChatCompletionResponse | ResponsesApiResponse | AnthropicApiResponse;
+
 interface GenerateCommitConfig {
   apiEndpoint: string;
   apiKey: string;
@@ -140,12 +152,6 @@ interface GenerateCommitConfig {
   retryCount: number;
   requestTimeoutMs: number;
   retryStatusCodes: number[];
-}
-
-interface ResolvedApiTarget {
-  endpoint: string;
-  mode: ResolvedApiMode;
-  isOfficialOpenAiHost: boolean;
 }
 
 interface ResponseErrorDetails {
@@ -196,56 +202,13 @@ function getConfig(): GenerateCommitConfig {
  * 规范化 API 端点，并推断实际调用模式
  */
 function resolveApiTarget(endpoint: string, configuredMode: ApiMode): ResolvedApiTarget {
-  const trimmed = endpoint.trim();
-  if (!trimmed) {
-    return {
-      endpoint: trimmed,
-      mode: configuredMode === 'responses' ? 'responses' : 'chat-completions',
-      isOfficialOpenAiHost: false
-    };
-  }
-
-  try {
-    const url = new URL(trimmed);
-    const rawPath = url.pathname || '/';
-    const path = rawPath.replace(/\/+$/, '');
-    const lowerPath = path.toLowerCase();
-    const explicitMode = detectApiModeFromPath(lowerPath);
-    const officialOpenAiHost = isOfficialOpenAiHost(url.hostname);
-    const mode = resolveRequestedApiMode(configuredMode, url, explicitMode);
-
-    if (explicitMode) {
-      if (configuredMode !== 'auto' && explicitMode !== mode) {
-        url.pathname = replaceApiEndpointPath(path, mode);
-      }
-      return {
-        endpoint: url.toString(),
-        mode,
-        isOfficialOpenAiHost: officialOpenAiHost
-      };
-    }
-
-    if (lowerPath === '' || lowerPath === '/' || lowerPath.endsWith('/v1')) {
-      url.pathname = buildApiEndpointPath(path, mode);
-    }
-
-    return {
-      endpoint: url.toString(),
-      mode,
-      isOfficialOpenAiHost: officialOpenAiHost
-    };
-  } catch {
-    return {
-      endpoint: trimmed,
-      mode: configuredMode === 'responses' ? 'responses' : 'chat-completions',
-      isOfficialOpenAiHost: false
-    };
-  }
+  return resolveApiTargetValue(endpoint, configuredMode);
 }
 
 function resolveApiMode(value: string | undefined): ApiMode {
-  if (value === 'auto' || value === 'chat-completions' || value === 'responses') {
-    return value;
+  const normalized = normalizeApiMode(value);
+  if (normalized) {
+    return normalized;
   }
   if (typeof value === 'string' && value.trim()) {
     logger.warn(`apiMode 配置无效: ${value}，已回退为 ${DEFAULT_API_MODE}`);
@@ -265,53 +228,6 @@ function resolveChatCompletionsDelivery(value: string | undefined): ChatCompleti
 
 function describeChatCompletionsDelivery(value: ChatCompletionsDelivery): string {
   return value === 'stream-first' ? '优先流式，失败后回退非流式' : '优先非流式，缺正文时回退流式';
-}
-
-function detectApiModeFromPath(path: string): ResolvedApiMode | undefined {
-  if (path.endsWith('/chat/completions')) {
-    return 'chat-completions';
-  }
-  if (path.endsWith('/responses')) {
-    return 'responses';
-  }
-  return undefined;
-}
-
-function resolveRequestedApiMode(
-  configuredMode: ApiMode,
-  url: URL,
-  explicitMode?: ResolvedApiMode
-): ResolvedApiMode {
-  if (configuredMode !== 'auto') {
-    return configuredMode;
-  }
-  if (explicitMode) {
-    return explicitMode;
-  }
-  return isOfficialOpenAiHost(url.hostname) ? 'responses' : 'chat-completions';
-}
-
-function buildApiEndpointPath(path: string, mode: ResolvedApiMode): string {
-  const endpointSuffix = mode === 'responses' ? 'responses' : 'chat/completions';
-  if (!path || path === '/') {
-    return `/v1/${endpointSuffix}`;
-  }
-  return `${path}/${endpointSuffix}`;
-}
-
-function replaceApiEndpointPath(path: string, mode: ResolvedApiMode): string {
-  const nextPath = mode === 'responses' ? '/responses' : '/chat/completions';
-  if (/\/responses$/i.test(path)) {
-    return path.replace(/\/responses$/i, nextPath);
-  }
-  if (/\/chat\/completions$/i.test(path)) {
-    return path.replace(/\/chat\/completions$/i, nextPath);
-  }
-  return path;
-}
-
-function isOfficialOpenAiHost(hostname: string): boolean {
-  return OPENAI_API_HOSTS.has(hostname.toLowerCase());
 }
 
 function resolveRetryCount(value: number | undefined, defaultValue = DEFAULT_RETRY_COUNT): number {
@@ -477,11 +393,24 @@ function parseRetryAfterHeader(value: string | null): number | null {
   return null;
 }
 
-function extractGeneratedText(mode: ResolvedApiMode, data: ChatCompletionResponse | ResponsesApiResponse): string {
-  const primaryExtractor = mode === 'responses'
+function extractGeneratedText(mode: ResolvedApiMode, data: ApiResponse): string {
+  if (mode === 'anthropic') {
+    const anthropicText = tryExtractText(
+      (value) => extractAnthropicResponseText(value as AnthropicApiResponse),
+      data
+    );
+    if (anthropicText) {
+      return anthropicText;
+    }
+
+    logger.errorBlock('API 响应缺少可用文本内容', buildExtractionFailureFields(mode, data));
+    throw new Error('API 返回结果缺少可用文本，请查看 AI Git Commit 日志中的响应摘要');
+  }
+
+  const primaryExtractor = mode === 'openai-responses'
     ? (value: unknown) => extractResponsesText(value as ResponsesApiResponse)
     : (value: unknown) => extractChatCompletionText(value as ChatCompletionResponse);
-  const fallbackExtractor = mode === 'responses'
+  const fallbackExtractor = mode === 'openai-responses'
     ? (value: unknown) => extractChatCompletionText(value as ChatCompletionResponse)
     : (value: unknown) => extractResponsesText(value as ResponsesApiResponse);
   const primaryText = tryExtractText(primaryExtractor, data);
@@ -493,7 +422,7 @@ function extractGeneratedText(mode: ResolvedApiMode, data: ChatCompletionRespons
   if (fallbackText) {
     logger.warnBlock('API 响应格式与当前模式不一致，已自动回退解析', [
       { label: '当前模式', value: mode },
-      { label: '回退模式', value: mode === 'responses' ? 'chat-completions' : 'responses' },
+      { label: '回退模式', value: mode === 'openai-responses' ? 'openai-chat' : 'openai-responses' },
       { label: '对象类型', value: readStringField(data, 'object') || '未知' }
     ]);
     return fallbackText;
@@ -505,9 +434,9 @@ function extractGeneratedText(mode: ResolvedApiMode, data: ChatCompletionRespons
 
 function shouldRetryWithStream(
   mode: ResolvedApiMode,
-  data: ChatCompletionResponse | ResponsesApiResponse
+  data: ApiResponse
 ): data is ChatCompletionResponse {
-  if (mode !== 'chat-completions' || !('choices' in data) || !Array.isArray(data.choices) || data.choices.length === 0) {
+  if (mode !== 'openai-chat' || !('choices' in data) || !Array.isArray(data.choices) || data.choices.length === 0) {
     return false;
   }
 
@@ -614,11 +543,11 @@ function extractTextFromUnknown(value: unknown, depth = 0): string {
 
 function buildExtractionFailureFields(
   mode: ResolvedApiMode,
-  data: ChatCompletionResponse | ResponsesApiResponse
+  data: ApiResponse
 ): logger.LogField[] {
   const fields: Array<logger.LogField | undefined> = [
     { label: '接口模式', value: mode },
-    { label: '对象类型', value: readStringField(data, 'object') || '未知' },
+    { label: '对象类型', value: readStringField(data, 'object') || readStringField(data, 'type') || '未知' },
     { label: '模型', value: readStringField(data, 'model') || '未知' }
   ];
 
@@ -637,18 +566,25 @@ function buildExtractionFailureFields(
         : undefined,
       { label: '响应预览', value: buildSuccessfulResponsePreview(data) }
     );
-  } else {
+  } else if ('output' in data || 'output_text' in data) {
     fields.push(
       { label: 'output 数量', value: Array.isArray(data.output) ? data.output.length : 0 },
       { label: 'output_text 类型', value: describeValueShape(data.output_text) },
       { label: '响应预览', value: buildSuccessfulResponsePreview(data) }
     );
+  } else if ('content' in data) {
+    fields.push(
+      { label: 'content 数量', value: Array.isArray(data.content) ? data.content.length : 0 },
+      { label: '响应预览', value: buildSuccessfulResponsePreview(data) }
+    );
+  } else {
+    fields.push({ label: '响应预览', value: buildSuccessfulResponsePreview(data) });
   }
 
   return fields.filter((field): field is logger.LogField => Boolean(field));
 }
 
-function buildSuccessfulResponsePreview(data: ChatCompletionResponse | ResponsesApiResponse): string {
+function buildSuccessfulResponsePreview(data: ApiResponse): string {
   try {
     return compactText(JSON.stringify(data), RESPONSE_PREVIEW_MAX_CHARS);
   } catch {
@@ -693,19 +629,34 @@ function createChatCompletionUsageEnvelope(
   };
 }
 
+function createAnthropicUsageEnvelope(
+  model: string,
+  usage?: AnthropicUsage
+): AnthropicApiResponse | undefined {
+  if (!usage) {
+    return undefined;
+  }
+
+  return {
+    id: 'stream-fallback',
+    type: 'message',
+    role: 'assistant',
+    model,
+    content: [],
+    usage
+  };
+}
+
 async function requestJsonApiData(
   apiTarget: ResolvedApiTarget,
   apiKey: string,
   model: string,
   payload: Record<string, unknown>,
   options: RequestWithRetryOptions
-): Promise<ChatCompletionResponse | ResponsesApiResponse> {
+): Promise<ApiResponse> {
   return requestWithRetry(apiTarget.endpoint, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`
-    },
+    headers: buildRequestHeaders(apiTarget.mode, apiKey),
     body: JSON.stringify(payload)
   }, options, async (response) => {
     if (!response.ok) {
@@ -739,7 +690,7 @@ async function requestJsonApiData(
       );
     }
 
-    return await response.json() as ChatCompletionResponse | ResponsesApiResponse;
+    return await response.json() as ApiResponse;
   });
 }
 
@@ -748,7 +699,7 @@ async function resolveChatCompletionsMessage(
   config: GenerateCommitConfig,
   requestPayload: Record<string, unknown>,
   requestOptions: RequestWithRetryOptions
-): Promise<{ text: string; usageData?: ChatCompletionResponse | ResponsesApiResponse }> {
+): Promise<{ text: string; usageData?: ApiResponse }> {
   if (config.chatCompletionsDelivery === 'stream-first') {
     try {
       const streamResult = await requestChatCompletionTextFromStream(
@@ -798,6 +749,100 @@ async function resolveChatCompletionsMessage(
   };
 }
 
+async function resolveAnthropicMessage(
+  apiTarget: ResolvedApiTarget,
+  config: GenerateCommitConfig,
+  requestPayload: Record<string, unknown>,
+  requestOptions: RequestWithRetryOptions
+): Promise<{ text: string; usageData?: ApiResponse }> {
+  if (config.chatCompletionsDelivery === 'stream-first') {
+    try {
+      const streamResult = await requestAnthropicTextFromStream(
+        apiTarget.endpoint,
+        config.apiKey,
+        requestPayload,
+        requestOptions
+      );
+      return {
+        text: streamResult.text,
+        usageData: createAnthropicUsageEnvelope(config.model, streamResult.usage)
+      };
+    } catch (error) {
+      if (requestOptions.signal?.aborted) {
+        throw createAbortError();
+      }
+      logger.warnBlock('Anthropic 优先流式解析失败，准备回退到非流式请求', [
+        { label: '接口地址', value: apiTarget.endpoint },
+        { label: '模型', value: config.model },
+        error instanceof Error ? { label: '错误信息', value: error.message } : undefined
+      ]);
+    }
+  }
+
+  const data = await requestJsonApiData(apiTarget, config.apiKey, config.model, requestPayload, requestOptions);
+  if (
+    config.chatCompletionsDelivery === 'non-stream-first'
+    && !extractAnthropicResponseText(data as AnthropicApiResponse)
+  ) {
+    logger.warnBlock('检测到 Anthropic 非流式响应缺少正文，准备回退到流式解析', [
+      { label: '接口地址', value: apiTarget.endpoint },
+      { label: '模型', value: config.model },
+      { label: '对象类型', value: readStringField(data, 'type') || '未知' }
+    ]);
+    const streamResult = await requestAnthropicTextFromStream(
+      apiTarget.endpoint,
+      config.apiKey,
+      requestPayload,
+      requestOptions
+    );
+    return {
+      text: streamResult.text,
+      usageData: createAnthropicUsageEnvelope(config.model, streamResult.usage) || data
+    };
+  }
+
+  return {
+    text: extractGeneratedText(apiTarget.mode, data),
+    usageData: data
+  };
+}
+
+async function requestAnthropicTextFromStream(
+  endpoint: string,
+  apiKey: string,
+  payload: Record<string, unknown>,
+  options: RequestWithRetryOptions
+): Promise<AnthropicStreamResult> {
+  return requestWithRetry(endpoint, {
+    method: 'POST',
+    headers: buildRequestHeaders('anthropic', apiKey, true),
+    body: JSON.stringify({
+      ...payload,
+      stream: true
+    })
+  }, options, async (response) => {
+    if (!response.ok) {
+      const responseDetails = await extractResponseErrorDetails(response);
+      logger.errorBlock('Anthropic 流式请求失败', buildResponseLogFields(response, responseDetails, [
+        { label: '接口地址', value: endpoint }
+      ]));
+      throw new Error(buildStatusLabel(response));
+    }
+
+    const rawStream = await response.text();
+    const streamResult = extractAnthropicStreamText(rawStream);
+    if (streamResult.text) {
+      return streamResult;
+    }
+
+    logger.errorBlock('Anthropic 流式响应未提取到正文', [
+      { label: '接口地址', value: endpoint },
+      { label: '响应预览', value: compactText(rawStream, RESPONSE_PREVIEW_MAX_CHARS) || '响应体为空' }
+    ]);
+    throw new Error('Anthropic 流式响应中未包含可用文本');
+  });
+}
+
 async function requestChatCompletionTextFromStream(
   endpoint: string,
   apiKey: string,
@@ -806,11 +851,7 @@ async function requestChatCompletionTextFromStream(
 ): Promise<ChatCompletionStreamResult> {
   return requestWithRetry(endpoint, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
-      'Accept': 'text/event-stream'
-    },
+    headers: buildRequestHeaders('openai-chat', apiKey, true),
     body: JSON.stringify({
       ...payload,
       stream: true
@@ -889,17 +930,30 @@ function extractChatCompletionStreamText(rawStream: string): ChatCompletionStrea
   };
 }
 
-function logUsage(mode: ResolvedApiMode, data: ChatCompletionResponse | ResponsesApiResponse): void {
+function logUsage(mode: ResolvedApiMode, data: ApiResponse): void {
   if (!data.usage) {
     return;
   }
 
-  if (mode === 'responses') {
+  if (mode === 'openai-responses') {
     const usage = data.usage as ResponsesApiResponse['usage'];
     logger.infoBlock('Token 使用统计', [
       { label: 'input', value: usage?.input_tokens ?? '-' },
       { label: 'output', value: usage?.output_tokens ?? '-' },
       { label: 'total', value: usage?.total_tokens ?? '-' }
+    ]);
+    return;
+  }
+
+  if (mode === 'anthropic') {
+    const usage = data.usage as AnthropicUsage;
+    const total = typeof usage.input_tokens === 'number' && typeof usage.output_tokens === 'number'
+      ? usage.input_tokens + usage.output_tokens
+      : '-';
+    logger.infoBlock('Token 使用统计', [
+      { label: 'input', value: usage.input_tokens ?? '-' },
+      { label: 'output', value: usage.output_tokens ?? '-' },
+      { label: 'total', value: total }
     ]);
     return;
   }
@@ -1327,14 +1381,14 @@ export async function generateCommitMessage(diff: string, signal?: AbortSignal):
     config.diffMergeMode === 'remote' && diffChunks.length > 1
       ? { label: '归并模型', value: config.mergeModel || config.model }
       : undefined,
-    apiTarget.mode === 'chat-completions'
+    (apiTarget.mode === 'openai-chat' || apiTarget.mode === 'anthropic')
       ? { label: '正文获取策略', value: describeChatCompletionsDelivery(config.chatCompletionsDelivery) }
       : undefined,
     { label: '重试次数', value: `${config.retryCount} 次` },
     { label: '超时时间', value: `${config.requestTimeoutMs}ms` },
     { label: '重试状态码', value: retryStatusLabel }
   ]);
-  if (apiTarget.isOfficialOpenAiHost) {
+  if (apiTarget.isOfficialOpenAiHost && apiTarget.mode !== 'anthropic') {
     logger.info('检测到官方 OpenAI 端点，请求将附带 store=false 以避免默认保存 diff 内容');
   }
 
@@ -1449,10 +1503,19 @@ async function requestAiMessage(
   model: string,
   prompt: string,
   requestOptions: RequestWithRetryOptions
-): Promise<{ text: string; usageData?: ChatCompletionResponse | ResponsesApiResponse }> {
+): Promise<{ text: string; usageData?: ApiResponse }> {
   const requestPayload = buildRequestPayload(apiTarget, model, prompt, config.maxOutputTokens);
-  if (apiTarget.mode === 'chat-completions') {
+  if (apiTarget.mode === 'openai-chat') {
     return resolveChatCompletionsMessage(
+      apiTarget,
+      { ...config, model },
+      requestPayload,
+      requestOptions
+    );
+  }
+
+  if (apiTarget.mode === 'anthropic') {
+    return resolveAnthropicMessage(
       apiTarget,
       { ...config, model },
       requestPayload,
@@ -1478,7 +1541,7 @@ async function requestValidatedAiMessage(
   files: string[],
   requestOptions: RequestWithRetryOptions,
   contextLabel: string
-): Promise<{ text: string; usageData?: ChatCompletionResponse | ResponsesApiResponse }> {
+): Promise<{ text: string; usageData?: ApiResponse }> {
   try {
     return await retryAsyncTask(async () => {
       const result = await requestAiMessage(apiTarget, config, model, prompt, requestOptions);
