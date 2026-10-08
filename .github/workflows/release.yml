@@ -1,3 +1,11 @@
+# @name: 扩展自动打包发布
+# @Descripttion: 推送版本标签后构建 VSIX 并附带对应更新说明发布到 GitHub
+# @version: 1.0.0
+# @Author: sm
+# @Date: 2026-10-08 16:55:45
+# @LastEditTime: 2026-10-08 16:55:45
+# @FilePath: .github/workflows/release.yml
+
 name: Package VSIX on Tag
 
 on:
@@ -62,7 +70,23 @@ jobs:
           name: vsix
           path: ${{ steps.vsix.outputs.file }}
 
+      - name: Prepare release notes
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const changelog = fs.readFileSync('CHANGELOG.md', 'utf8');
+          const heading = `## ${process.env.GITHUB_REF_NAME} - `;
+          const section = changelog.split(/^## /m).find((entry) => `## ${entry}`.startsWith(heading));
+          if (!section) {
+            throw new Error(`Missing changelog for ${process.env.GITHUB_REF_NAME}`);
+          }
+          const notes = section.slice(section.indexOf('\n') + 1).trim();
+          fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'release-notes.md'), `${notes}\n`);
+          NODE
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: ${{ runner.temp }}/release-notes.md
           files: ${{ steps.vsix.outputs.file }}

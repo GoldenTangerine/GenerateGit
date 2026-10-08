@@ -1,6 +1,13 @@
 /**
  * Diff 解析工具
  * @author sm
+ * @name: Diff 路径解析
+ * @Descripttion: 提取变更文件路径并还原 Git 引号内的 UTF-8 转义
+ * @version: 1.0.0
+ * @Author: sm
+ * @Date: 2026-10-08 16:49:52
+ * @LastEditTime: 2026-10-08 16:49:52
+ * @FilePath: src/utils/diff.ts
  */
 
 /**
@@ -43,17 +50,37 @@ function parseDiffGitLine(line: string): { before: string; after: string } | nul
     return null;
   }
 
-  const match = line.match(/^diff --git (?:\"(.+?)\"|(\S+)) (?:\"(.+?)\"|(\S+))$/);
+  const match = line.match(/^diff --git ("(?:\\.|[^"\\])*"|a\/.+?|\/dev\/null) ("(?:\\.|[^"\\])*"|b\/.+|\/dev\/null)$/);
   if (!match) {
     return null;
   }
 
-  const before = match[1] || match[2];
-  const after = match[3] || match[4];
+  const before = decodeGitPath(match[1]);
+  const after = decodeGitPath(match[2]);
 
   if (!before || !after) {
     return null;
   }
 
   return { before, after };
+}
+
+function decodeGitPath(value: string): string {
+  if (!value.startsWith('"') || !value.endsWith('"')) {
+    return value;
+  }
+
+  const escapes: Record<string, string> = {
+    a: '\x07', b: '\b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v',
+    '"': '"', '\\': '\\'
+  };
+
+  // Git 八进制转义表示 UTF-8 字节；单次替换避免把字面反斜杠再次解码。
+  return value.slice(1, -1).replace(/(?:\\[0-3][0-7]{2})+|\\([abfnrtv"\\])/g, (escaped, character: string | undefined) => {
+    if (character !== undefined) {
+      return escapes[character];
+    }
+    const bytes = escaped.slice(1).split('\\').map((octal: string) => parseInt(octal, 8));
+    return Buffer.from(bytes).toString('utf8');
+  });
 }

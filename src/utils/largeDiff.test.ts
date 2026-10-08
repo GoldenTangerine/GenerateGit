@@ -23,7 +23,7 @@ import {
 } from './largeDiff';
 import { extractChangedFilePaths } from './diff';
 import { buildMergePrompt, buildPrompt, getDefaultMergePrompt, getDefaultPrompt } from './prompt';
-import { buildOutputTemplatePreview, DEFAULT_OUTPUT_TEMPLATE } from './outputTemplate';
+import { buildOutputTemplatePreview, DEFAULT_OUTPUT_TEMPLATE, renderOutputTemplate } from './outputTemplate';
 import {
   ANTHROPIC_API_VERSION,
   buildChatCompletionStreamPayload,
@@ -42,6 +42,73 @@ import {
   sanitizeThinkingResponseText,
   shouldFallbackThinkingRequest
 } from './requestPayload';
+
+const chineseFile = 'src/views/digitalRegulation/省内基础指标_columns配置_展开时段_含indexCode_含分工.json';
+const quotedChineseFile = String.raw`src/views/digitalRegulation/\347\234\201\345\206\205\345\237\272\347\241\200\346\214\207\346\240\207_columns\351\205\215\347\275\256_\345\261\225\345\274\200\346\227\266\346\256\265_\345\220\253indexCode_\345\220\253\345\210\206\345\267\245.json`;
+
+test('Git 八进制 UTF-8 路径还原为完整中文文件名', () => {
+  const diff = `diff --git "a/${quotedChineseFile}" "b/${quotedChineseFile}"\n`;
+  assert.deepEqual(extractChangedFilePaths(diff), [chineseFile]);
+});
+
+test('已解码路径按顺序去重并兼容未转义中文和空格', () => {
+  const diff = [
+    `diff --git "a/${quotedChineseFile}" "b/${quotedChineseFile}"`,
+    `diff --git a/${chineseFile} b/${chineseFile}`,
+    'diff --git a/src/中文 配置.json b/src/中文 配置.json',
+    'diff --git a/src/plain.ts b/src/plain.ts'
+  ].join('\n');
+  assert.deepEqual(extractChangedFilePaths(diff), [chineseFile, 'src/中文 配置.json', 'src/plain.ts']);
+});
+
+test('重命名采用新路径，删除保留旧路径，兼容单侧引号', () => {
+  const diff = [
+    `diff --git a/src/old.json "b/${quotedChineseFile}"`,
+    `diff --git "a/${quotedChineseFile}" b/src/new.json`,
+    'diff --git "a/src/\\345\\210\\240\\351\\231\\244.json" /dev/null',
+    'diff --git /dev/null "b/src/\\346\\226\\260.json"'
+  ].join('\n');
+  assert.deepEqual(extractChangedFilePaths(diff), [chineseFile, 'src/new.json', 'src/删除.json', 'src/新.json']);
+});
+
+test('Git 引号和反斜杠仅解码一次，保留文件名中的字面转义序列', () => {
+  const diff = String.raw`diff --git "a/src/\"省\"\\347.json" "b/src/\"省\"\\347.json"`;
+  assert.deepEqual(extractChangedFilePaths(diff), [String.raw`src/"省"\347.json`]);
+});
+
+test('Git 控制字符转义与四字节 UTF-8 路径正确解码', () => {
+  const diff = String.raw`diff --git "a/src/\360\237\230\200\t\n\r\a\b\f\v.json" "b/src/\360\237\230\200\t\n\r\a\b\f\v.json"`;
+  assert.deepEqual(extractChangedFilePaths(diff), ['src/😀\t\n\r\x07\b\f\v.json']);
+});
+
+test('正文中的转义文本不会被当成路径解析', () => {
+  const diff = buildDiff('src/plain.ts', String.raw`+const sample = "\347\234\201";`);
+  assert.deepEqual(extractChangedFilePaths(diff), ['src/plain.ts']);
+  assert.deepEqual(extractChangedFilePaths('diff --git "a/broken b/broken\n'), []);
+});
+
+test('中文路径贯穿分段提示词、结果校验、归并和最终模板', () => {
+  const diff = `diff --git "a/${quotedChineseFile}" "b/${quotedChineseFile}"\n${'+value\n'.repeat(250)}`;
+  const files = extractChangedFilePaths(diff);
+  const chunks = splitDiffIntoChunks(diff, 1000);
+  assert.ok(chunks.length > 1);
+  for (const chunk of chunks) {
+    assert.deepEqual(extractChangedFilePaths(chunk), [chineseFile]);
+    const prompt = buildPrompt(chunk);
+    const fileSection = prompt.split('## 变更文件清单（按 diff 顺序）')[1].split('## Git Diff 内容')[0];
+    assert.ok(fileSection.includes(`- ${chineseFile}`));
+    assert.ok(fileSection.includes(`- [<变更类型>] ${chineseFile}：<变更描述>`));
+    assert.ok(!fileSection.includes(quotedChineseFile));
+  }
+  const message = `🐞 fix: 修复指标配置\n\n变更内容：\n- [修改] ${chineseFile}：修复展开时段配置`;
+  assert.equal(validateCommitMessage(message, files).valid, true);
+  const merged = mergeCommitMessagesLocally([message, message], files);
+  const rendered = renderOutputTemplate(DEFAULT_OUTPUT_TEMPLATE, merged.title, buildChangeLines(files, merged.changes), files);
+  assert.ok(rendered.includes(`- [修改] ${chineseFile}：修复展开时段配置`));
+  assert.ok(rendered.includes(`涉及组件：\n- ${chineseFile}`));
+  assert.ok(!rendered.includes(quotedChineseFile));
+  assert.ok(buildMergePrompt([message], { fileList: files }).includes(`- ${chineseFile}`));
+});
 
 test('未超限的 diff 保持为单段', () => {
   const diff = buildDiff('src/a.ts', '+const value = 1;\n');
