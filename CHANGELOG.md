@@ -10,6 +10,31 @@
 
 # Changelog
 
+## v1.4.0 - 2026-10-19
+
+### Added
+- 内置 Prompt 新增按运行行为判定 type 的规则和缺陷修复示例，分析与远程归并共用同一套标准
+- 默认附带改动所在函数的完整上下文，单文件膨胀超过 4000 字符时自动回退为标准 diff
+- 锁文件、压缩产物、`dist/**`、快照等文件以及已删除文件只发送文件头和增删行数摘要
+- 全部文件为文档、测试、CI 配置或锁文件时，直接判定为 `docs` / `test` / `ci` / `build`
+- 提交输入框已有内容时作为提交意图参考，并参考当前分支名和近期提交的 scope 与措辞
+- 暂存区为空时可选择暂存全部后生成，或仅分析未暂存改动
+- 单段 diff 时流式写入输入框实时预览，失败或取消时恢复输入框原有内容
+- 新增候选标题选择、分支 issue 编号自动引用和英文输出
+- 新增快捷键 `Cmd+Alt+G` / `Ctrl+Alt+G`，并在“暂存的更改”分组上提供生成入口
+- 分段数超过阈值时先确认再请求，状态栏显示分段与归并进度
+- 新增 `diffContext`、`summaryOnlyPatterns`、`compactDeletedFiles`、`useInputAsHint`、`recentCommitCount`、`appendIssueFooter`、`titleCandidateCount`、`language`、`confirmChunkThreshold`、`streamToInputBox` 配置
+
+### Changed
+- `style` 仅表示代码格式化，CSS 与界面改动不再归为 `style`；fix 标题需写明修复的场景和现象
+- 关闭内置思考时 `temperature` 由 0.7 调整为 0.2，降低 type 判定的随机波动
+- 本地归并不再拼接各段标题，改为选取变更行数最多的 type 对应标题
+- 近期提交和输入框意图在发送前去掉 emoji 与 type，避免历史误判影响本次结果
+
+### Fixed
+- 修复缺陷修复类改动经常被生成为样式调整或美化的问题
+- 修复模型输出 emoji 与 type 不匹配时原样写入的问题，现按对照表自动校正
+
 ## v1.3.4 - 2026-10-08
 
 ### Fixed

@@ -76,6 +76,8 @@ export interface ChatCompletionStreamResult {
 }
 
 const OPENAI_API_HOSTS = new Set(['api.openai.com']);
+// 提交消息属于分类与概括任务，较低温度可减少 type 判定的随机波动
+const DEFAULT_TEMPERATURE = 0.2;
 const PROTECTED_REQUEST_FIELDS = new Set(['model', 'messages', 'input', 'stream']);
 const UNSAFE_OBJECT_FIELDS = new Set(['__proto__', 'prototype', 'constructor']);
 export const ANTHROPIC_API_VERSION = '2023-06-01';
@@ -188,7 +190,7 @@ export function buildRequestPayload(
       max_output_tokens: maxOutputTokens,
       ...(thinking.enabled
         ? { reasoning: { effort: thinking.effort, summary: 'auto' } }
-        : { temperature: 0.7 }),
+        : { temperature: DEFAULT_TEMPERATURE }),
       ...openAiStorePayload
     };
   } else if (target.mode === 'anthropic') {
@@ -206,7 +208,7 @@ export function buildRequestPayload(
           thinking: { type: 'adaptive', display: 'summarized' },
           output_config: { effort: thinking.effort }
         }
-        : { temperature: 0.7 })
+        : { temperature: DEFAULT_TEMPERATURE })
     };
   } else {
     payload = {
@@ -223,7 +225,7 @@ export function buildRequestPayload(
           max_completion_tokens: maxOutputTokens
         }
         : {
-          temperature: 0.7,
+          temperature: DEFAULT_TEMPERATURE,
           max_tokens: maxOutputTokens
         }),
       ...openAiStorePayload
@@ -548,6 +550,39 @@ export function extractChatCompletionStreamText(rawStream: string): ChatCompleti
     thinking: thinkingFragments.join('').trim() || undefined,
     usage
   };
+}
+
+/**
+ * 宽松解析未结束的流式响应，仅用于实时预览正文；兼容 OpenAI Chat 与 Anthropic 事件格式
+ */
+export function extractStreamPreviewText(rawStream: string): string {
+  const fragments: string[] = [];
+
+  for (const line of rawStream.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(trimmed.slice(5).trim()) as Record<string, unknown>;
+      const delta = parsed.delta as Record<string, unknown> | undefined;
+      if (parsed.type === 'content_block_delta' && delta?.type === 'text_delta' && typeof delta.text === 'string') {
+        fragments.push(delta.text);
+        continue;
+      }
+      const choices = Array.isArray(parsed.choices) ? parsed.choices as Array<Record<string, unknown>> : [];
+      choices.forEach((choice) => {
+        const choiceDelta = choice.delta as Record<string, unknown> | undefined;
+        if (typeof choiceDelta?.content === 'string') {
+          fragments.push(choiceDelta.content);
+        }
+      });
+    } catch {
+      // 最后一行可能尚未传输完整，忽略即可
+    }
+  }
+
+  return fragments.join('');
 }
 
 export function extractAnthropicStreamText(rawStream: string): AnthropicStreamResult {

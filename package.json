@@ -2,7 +2,7 @@
   "name": "generate-git-commit",
   "displayName": "AI Git Commit Message Generator",
   "description": "使用 AI 自动生成符合规范的 Git 提交消息",
-  "version": "1.3.4",
+  "version": "1.4.0",
   "publisher": "shumin",
   "icon": "icon.png",
   "engines": {
@@ -39,8 +39,23 @@
           "group": "navigation",
           "when": "scmProvider == git"
         }
+      ],
+      "scm/resourceGroup/context": [
+        {
+          "command": "generate-git-commit.generate",
+          "group": "inline",
+          "when": "scmProvider == git && scmResourceGroup == index"
+        }
       ]
     },
+    "keybindings": [
+      {
+        "command": "generate-git-commit.generate",
+        "key": "ctrl+alt+g",
+        "mac": "cmd+alt+g",
+        "when": "gitOpenRepositoryCount != 0"
+      }
+    ],
     "configuration": {
       "title": "AI Git Commit Message Generator",
       "properties": {
@@ -194,7 +209,7 @@
             "remote"
           ],
           "enumDescriptions": [
-            "本地拼接分段标题和文件描述，不增加归并请求",
+            "本地按主导 type 选取分段标题并拼接文件描述，不增加归并请求",
             "使用远程模型递归归并分段结果"
           ],
           "description": "超长 diff 分段结果的归并方式"
@@ -246,6 +261,92 @@
           "type": "number",
           "default": 60000,
           "description": "单次底层 API 请求全流程超时时间（毫秒），包含连接、响应体读取和解析"
+        },
+        "generateGitCommit.diffContext": {
+          "type": "string",
+          "default": "function",
+          "enum": [
+            "function",
+            "standard"
+          ],
+          "enumDescriptions": [
+            "附带改动所在的完整函数，便于判断改动意图；单个文件膨胀超过 4000 字符时自动回退为标准 diff",
+            "使用 git 默认的 3 行上下文"
+          ],
+          "description": "发送给模型的 diff 上下文范围"
+        },
+        "generateGitCommit.summaryOnlyPatterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**/pnpm-lock.yaml",
+            "**/package-lock.json",
+            "**/npm-shrinkwrap.json",
+            "**/yarn.lock",
+            "**/bun.lockb",
+            "**/*.lock",
+            "**/*.min.js",
+            "**/*.min.css",
+            "**/*.map",
+            "**/dist/**",
+            "**/__snapshots__/**",
+            "**/*.snap"
+          ],
+          "description": "仅发送文件头和增删行数摘要的文件 glob 列表（锁文件、构建产物等），设为 [] 可关闭"
+        },
+        "generateGitCommit.compactDeletedFiles": {
+          "type": "boolean",
+          "default": true,
+          "description": "被删除的文件只发送文件头和删除行数，不发送原有内容"
+        },
+        "generateGitCommit.useInputAsHint": {
+          "type": "boolean",
+          "default": true,
+          "description": "生成前若提交输入框已有内容，将其作为提交意图提供给模型参考（与上次生成结果相同或处于合并/变基时忽略）"
+        },
+        "generateGitCommit.recentCommitCount": {
+          "type": "number",
+          "default": 10,
+          "minimum": 0,
+          "description": "参考最近多少条提交的 scope 与措辞风格（会去掉 emoji 和 type），0 表示不参考"
+        },
+        "generateGitCommit.appendIssueFooter": {
+          "type": "boolean",
+          "default": true,
+          "description": "分支名包含 issue 编号（如 feature/PROJ-123-xxx、fix/123-xxx）时，在消息末尾追加 Refs 引用"
+        },
+        "generateGitCommit.titleCandidateCount": {
+          "type": "number",
+          "default": 1,
+          "minimum": 1,
+          "maximum": 5,
+          "description": "候选标题数量；大于 1 时会额外请求一次并弹出列表供选择，1 表示不生成候选"
+        },
+        "generateGitCommit.language": {
+          "type": "string",
+          "default": "zh-CN",
+          "enum": [
+            "zh-CN",
+            "en"
+          ],
+          "enumDescriptions": [
+            "中文主题与描述",
+            "英文主题与描述（段落标题和变更类型标签保持模板原样）"
+          ],
+          "description": "提交消息主题与变更描述的语言"
+        },
+        "generateGitCommit.confirmChunkThreshold": {
+          "type": "number",
+          "default": 5,
+          "minimum": 0,
+          "description": "diff 分段数超过该值时先弹窗确认再请求，0 表示不确认"
+        },
+        "generateGitCommit.streamToInputBox": {
+          "type": "boolean",
+          "default": true,
+          "description": "单段 diff 且使用 Anthropic / OpenAI Chat 接口时，优先流式请求并实时写入输入框；显式设置 chatCompletionsDelivery 为 non-stream-first 时不生效，失败时自动回退并恢复原内容"
         }
       }
     }

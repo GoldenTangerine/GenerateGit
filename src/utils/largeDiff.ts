@@ -8,7 +8,10 @@
  * @FilePath: src/utils/largeDiff.ts
  */
 
+import { COMMIT_TYPES, CommitType } from './prompt';
+
 const DIFF_HEADER = 'diff --git ';
+const COMMIT_TITLE_PATTERN = /^(?:(\S+)\s+)?([a-z]+)(\([^)]*\))?(!)?\s*[:：]\s*(.+)$/;
 const CHANGE_TYPES = new Set<ChangeType>(['新增', '修改', '删除', '重命名']);
 
 export type ChangeType = '新增' | '修改' | '删除' | '重命名' | '未分类';
@@ -202,9 +205,6 @@ export function validateCommitMessage(message: string, files: string[]): CommitM
  * 本地拼接分段提交信息
  */
 export function mergeCommitMessagesLocally(messages: string[], files: string[]): LocalCommitMergeResult {
-  const titles = messages
-    .map(extractCommitTitle)
-    .filter((title): title is string => Boolean(title));
   const changes: FileChange[] = [];
   const seen = new Set<string>();
 
@@ -219,9 +219,77 @@ export function mergeCommitMessagesLocally(messages: string[], files: string[]):
   }
 
   return {
-    title: titles.join('；'),
+    title: selectPrimaryTitle(messages, files),
     changes
   };
+}
+
+/**
+ * 按 type 汇总各分段的变更行数，选出主导 type 下权重最高的标题，避免多段标题直接拼接
+ */
+function selectPrimaryTitle(messages: string[], files: string[]): string {
+  const candidates: { title: string; type: string; weight: number }[] = [];
+  const typeWeights = new Map<string, number>();
+
+  for (const message of messages) {
+    const title = extractCommitTitle(message);
+    if (!title) {
+      continue;
+    }
+    const type = title.match(COMMIT_TITLE_PATTERN)?.[2] || '';
+    const weight = Math.max(1, parseFileChanges(message, files).length);
+    typeWeights.set(type, (typeWeights.get(type) || 0) + weight);
+    candidates.push({ title, type, weight });
+  }
+
+  let selected = candidates[0];
+  for (const candidate of candidates.slice(1)) {
+    const candidateTypeWeight = typeWeights.get(candidate.type) || 0;
+    const selectedTypeWeight = typeWeights.get(selected.type) || 0;
+    if (
+      candidateTypeWeight > selectedTypeWeight
+      || (candidate.type === selected.type && candidate.weight > selected.weight)
+    ) {
+      selected = candidate;
+    }
+  }
+  return selected?.title || '';
+}
+
+export interface ParsedCommitTitle {
+  type: CommitType;
+  scope: string;
+  breaking: boolean;
+  subject: string;
+}
+
+/**
+ * 解析 `<emoji> <type>(<scope>): <主题>` 格式的标题；type 不在对照表内时返回 undefined
+ */
+export function parseCommitTitle(title: string): ParsedCommitTitle | undefined {
+  const match = title.match(COMMIT_TITLE_PATTERN);
+  if (!match || !Object.prototype.hasOwnProperty.call(COMMIT_TYPES, match[2])) {
+    return undefined;
+  }
+  return {
+    type: match[2] as CommitType,
+    scope: match[3] ? match[3].slice(1, -1) : '',
+    breaking: Boolean(match[4]),
+    subject: match[5].trim()
+  };
+}
+
+/**
+ * 按对照表校正标题中的 emoji 并统一冒号格式；传入 forcedType 时强制改写 type
+ */
+export function normalizeCommitTitle(title: string, forcedType?: CommitType): string {
+  const parsed = parseCommitTitle(title);
+  if (!parsed) {
+    return forcedType ? `${COMMIT_TYPES[forcedType].emoji} ${forcedType}: ${title.trim()}` : title;
+  }
+  const type = forcedType || parsed.type;
+  const scope = parsed.scope ? `(${parsed.scope})` : '';
+  return `${COMMIT_TYPES[type].emoji} ${type}${scope}${parsed.breaking ? '!' : ''}: ${parsed.subject}`;
 }
 
 export function parseFileChanges(message: string, files: string[]): FileChange[] {

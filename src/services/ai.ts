@@ -8,14 +8,21 @@ import * as logger from '../utils/logger';
 import {
   buildMergePrompt,
   buildPrompt,
+  buildTitleCandidatesPrompt,
+  COMMIT_LANGUAGES,
+  CommitLanguage,
+  CommitType,
   DEFAULT_DESCRIPTION_LENGTH_RANGE,
   DEFAULT_TITLE_LENGTH_RANGE,
   DESCRIPTION_LENGTH_RANGES,
   DescriptionLengthRange,
+  PromptContext,
   TITLE_LENGTH_RANGES,
   TitleLengthRange
 } from '../utils/prompt';
 import { extractChangedFilePaths } from '../utils/diff';
+import { compactDiff, DEFAULT_SUMMARY_ONLY_PATTERNS } from '../utils/diffFilter';
+import { detectForcedCommitType } from '../utils/commitContext';
 import { DEFAULT_REDACT_PATTERNS, redactSensitiveText } from '../utils/redact';
 import { DEFAULT_OUTPUT_TEMPLATE, renderOutputTemplate, resolveOutputTemplate } from '../utils/outputTemplate';
 import {
@@ -32,6 +39,7 @@ import {
   extractChatCompletionStreamText,
   extractResponseReasoningTokens,
   extractResponseThinking,
+  extractStreamPreviewText,
   normalizeApiMode,
   RequestBodyOverrides,
   requestWithThinkingFallback,
@@ -49,6 +57,8 @@ import {
   extractCommitTitle,
   mapWithConcurrency,
   mergeCommitMessagesLocally,
+  normalizeCommitTitle,
+  parseCommitTitle,
   parseFileChanges,
   retryAsyncTask,
   splitDiffIntoChunks,
@@ -80,6 +90,9 @@ const DEFAULT_MAX_OUTPUT_TOKENS = 10000;
 const DEFAULT_THINKING_ENABLED = true;
 const DEFAULT_THINKING_EFFORT = 'medium';
 const MAX_MERGE_ROUNDS = 20;
+const DEFAULT_LANGUAGE: CommitLanguage = 'zh-CN';
+const DEFAULT_CONFIRM_CHUNK_THRESHOLD = 5;
+const DEFAULT_STREAM_TO_INPUT_BOX = true;
 const RESPONSE_BODY_READ_TIMEOUT_MS = 1200;
 const RESPONSE_BODY_MAX_CHARS = 4000;
 const RESPONSE_SUMMARY_MAX_CHARS = 240;
@@ -90,6 +103,20 @@ interface RequestWithRetryOptions {
   timeoutMs: number;
   retryStatusCodes: Set<number>;
   signal?: AbortSignal;
+  // 流式请求时回调当前已收到的正文，用于实时预览
+  onTextDelta?: (text: string) => void;
+}
+
+export interface GenerateCommitOptions {
+  signal?: AbortSignal;
+  context?: Omit<PromptContext, 'forcedType' | 'language'>;
+  onProgress?: (text: string) => void;
+  onPartialText?: (text: string) => void;
+}
+
+export interface GeneratedCommit {
+  message: string;
+  forcedType?: CommitType;
 }
 
 /**
@@ -159,6 +186,7 @@ interface GenerateCommitConfig {
   model: string;
   apiMode: ApiMode;
   chatCompletionsDelivery: ChatCompletionsDelivery;
+  chatCompletionsDeliveryExplicit: boolean;
   thinkingEnabled: boolean;
   thinkingEffort: string;
   requestBodyOverrides: RequestBodyOverrides;
@@ -179,6 +207,11 @@ interface GenerateCommitConfig {
   retryCount: number;
   requestTimeoutMs: number;
   retryStatusCodes: number[];
+  summaryOnlyPatterns: string[];
+  compactDeletedFiles: boolean;
+  language: CommitLanguage;
+  confirmChunkThreshold: number;
+  streamToInputBox: boolean;
 }
 
 interface ResponseErrorDetails {
@@ -211,6 +244,7 @@ function getConfig(): GenerateCommitConfig {
     model: config.get<string>('model') || DEFAULT_MODEL,
     apiMode: resolveApiMode(config.get<string>('apiMode')),
     chatCompletionsDelivery: resolveChatCompletionsDelivery(config.get<string>('chatCompletionsDelivery')),
+    chatCompletionsDeliveryExplicit: isExplicitlyConfigured(config, 'chatCompletionsDelivery'),
     thinkingEnabled: config.get<boolean>('thinkingEnabled') ?? DEFAULT_THINKING_ENABLED,
     thinkingEffort: config.get<string>('thinkingEffort')?.trim() || DEFAULT_THINKING_EFFORT,
     requestBodyOverrides: resolveRequestBodyOverrides(config.get<unknown>('requestBodyOverrides')),
@@ -236,8 +270,37 @@ function getConfig(): GenerateCommitConfig {
     mergePrompt: config.get<string>('mergePrompt') || '',
     retryCount: resolveRetryCount(config.get<number>('retryCount')),
     requestTimeoutMs: resolveTimeoutMs(config.get<number>('requestTimeoutMs')),
-    retryStatusCodes: resolveRetryStatusCodes(config.get<number[]>('retryStatusCodes'))
+    retryStatusCodes: resolveRetryStatusCodes(config.get<number[]>('retryStatusCodes')),
+    summaryOnlyPatterns: config.get<string[]>('summaryOnlyPatterns') ?? DEFAULT_SUMMARY_ONLY_PATTERNS,
+    compactDeletedFiles: config.get<boolean>('compactDeletedFiles') ?? true,
+    language: resolveLanguage(config.get<string>('language')),
+    confirmChunkThreshold: resolveConfirmChunkThreshold(config.get<number>('confirmChunkThreshold')),
+    streamToInputBox: config.get<boolean>('streamToInputBox') ?? DEFAULT_STREAM_TO_INPUT_BOX
   };
+}
+
+function isExplicitlyConfigured(config: vscode.WorkspaceConfiguration, key: string): boolean {
+  const inspected = config.inspect(key);
+  return inspected?.globalValue !== undefined
+    || inspected?.workspaceValue !== undefined
+    || inspected?.workspaceFolderValue !== undefined;
+}
+
+function resolveLanguage(value: string | undefined): CommitLanguage {
+  if (value && (COMMIT_LANGUAGES as readonly string[]).includes(value)) {
+    return value as CommitLanguage;
+  }
+  if (typeof value === 'string' && value.trim()) {
+    logger.warn(`language 配置无效: ${value}，已回退为 ${DEFAULT_LANGUAGE}`);
+  }
+  return DEFAULT_LANGUAGE;
+}
+
+function resolveConfirmChunkThreshold(value: number | undefined): number {
+  if (typeof value !== 'number' || Number.isNaN(value) || value < 0) {
+    return DEFAULT_CONFIRM_CHUNK_THRESHOLD;
+  }
+  return Math.floor(value);
 }
 
 function resolveRequestBodyOverrides(value: unknown): RequestBodyOverrides {
@@ -931,7 +994,7 @@ async function requestAnthropicTextFromStream(
       throw createApiRequestError(buildStatusLabel(response), response.status, responseDetails);
     }
 
-    const rawStream = await response.text();
+    const rawStream = await readStreamBody(response, options.onTextDelta);
     const streamResult = extractAnthropicStreamText(rawStream);
     if (streamResult.text) {
       return streamResult;
@@ -968,7 +1031,7 @@ async function requestChatCompletionTextFromStream(
       throw createApiRequestError(buildStatusLabel(response), response.status, responseDetails);
     }
 
-    const rawStream = await response.text();
+    const rawStream = await readStreamBody(response, options.onTextDelta);
     const streamResult = extractChatCompletionStreamText(rawStream);
     if (streamResult.text) {
       return streamResult;
@@ -983,6 +1046,33 @@ async function requestChatCompletionTextFromStream(
     ]);
     throw new Error('API 流式响应中未包含可用文本');
   });
+}
+
+/**
+ * 读取流式响应体；提供回调时逐块解析并推送当前正文
+ */
+async function readStreamBody(response: Response, onTextDelta?: (text: string) => void): Promise<string> {
+  if (!onTextDelta || !response.body) {
+    return response.text();
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let rawStream = '';
+  let lastPreview = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    rawStream += decoder.decode(value, { stream: true });
+    const preview = extractStreamPreviewText(rawStream);
+    if (preview !== lastPreview) {
+      lastPreview = preview;
+      onTextDelta(preview);
+    }
+  }
+  return rawStream + decoder.decode();
 }
 
 function logUsage(mode: ResolvedApiMode, data: ApiResponse): void {
@@ -1409,7 +1499,11 @@ async function requestWithRetry<T>(
 /**
  * 调用 AI API 生成提交消息
  */
-export async function generateCommitMessage(diff: string, signal?: AbortSignal): Promise<string> {
+export async function generateCommitMessage(
+  diff: string,
+  options: GenerateCommitOptions = {}
+): Promise<GeneratedCommit> {
+  const { signal } = options;
   if (signal?.aborted) {
     throw createAbortError();
   }
@@ -1436,8 +1530,17 @@ export async function generateCommitMessage(diff: string, signal?: AbortSignal):
   }
 
   const changedFiles = extractChangedFilePaths(diff);
+  const forcedType = detectForcedCommitType(changedFiles);
+  const promptContext: PromptContext = { ...options.context, forcedType, language: config.language };
+  const compacted = compactDiff(diff, {
+    summaryPatterns: config.summaryOnlyPatterns,
+    compactDeletedFiles: config.compactDeletedFiles
+  });
+  if (compacted.compactedFiles.length > 0) {
+    logger.info(`以下文件仅发送摘要：${compacted.compactedFiles.join(', ')}（diff ${diff.length} -> ${compacted.text.length} 字符）`);
+  }
   const patterns = config.redactPatterns.length > 0 ? config.redactPatterns : DEFAULT_REDACT_PATTERNS;
-  const redactionResult = redactSensitiveText(diff, patterns);
+  const redactionResult = redactSensitiveText(compacted.text, patterns);
   if (redactionResult.invalidPatterns.length > 0) {
     logger.warn(`存在无效的脱敏正则：${redactionResult.invalidPatterns.join(', ')}`);
   }
@@ -1448,6 +1551,21 @@ export async function generateCommitMessage(diff: string, signal?: AbortSignal):
 
   // 对超长 diff 进行无损分段
   const diffChunks = splitDiffIntoChunks(redactionResult.text, config.maxDiffLength);
+  if (config.confirmChunkThreshold > 0 && diffChunks.length > config.confirmChunkThreshold) {
+    const confirmed = await vscode.window.showWarningMessage(
+      `本次变更共 ${redactionResult.text.length} 字符，将拆分为 ${diffChunks.length} 段分别请求，是否继续生成？`,
+      { modal: true },
+      '继续生成'
+    );
+    if (confirmed !== '继续生成') {
+      throw new vscode.CancellationError();
+    }
+  }
+  // 用户显式选择非流式优先时（多为代理不支持流式），不为实时预览强制改走流式
+  const canStreamPreview = config.chatCompletionsDelivery === 'stream-first' || !config.chatCompletionsDeliveryExplicit;
+  const streamPreview = diffChunks.length === 1 && config.streamToInputBox && canStreamPreview
+    ? options.onPartialText
+    : undefined;
 
   const retryStatusLabel = config.retryStatusCodes.length > 0
     ? config.retryStatusCodes.join(', ')
@@ -1456,6 +1574,8 @@ export async function generateCommitMessage(diff: string, signal?: AbortSignal):
     { label: '接口地址', value: apiTarget.endpoint },
     { label: '接口模式', value: apiTarget.mode },
     { label: '模型', value: config.model },
+    { label: '输出语言', value: config.language },
+    forcedType ? { label: '确定性 type', value: forcedType } : undefined,
     { label: '内置思考', value: config.thinkingEnabled ? '开启' : '关闭' },
     config.thinkingEnabled ? { label: '思考强度', value: config.thinkingEffort } : undefined,
     config.requestBodyOverrides[apiTarget.mode]
@@ -1487,8 +1607,15 @@ export async function generateCommitMessage(diff: string, signal?: AbortSignal):
       retryCount: config.retryCount,
       timeoutMs: config.requestTimeoutMs,
       retryStatusCodes: new Set(config.retryStatusCodes),
-      signal
+      signal,
+      onTextDelta: streamPreview
     };
+    // 实时预览依赖流式响应，单段请求时优先走流式，失败会自动回退非流式
+    const chunkConfig: GenerateCommitConfig = streamPreview
+      ? { ...config, chatCompletionsDelivery: 'stream-first' }
+      : config;
+    let completedChunks = 0;
+    options.onProgress?.(diffChunks.length > 1 ? `分析 0/${diffChunks.length}` : '分析中');
     const partialMessages = await mapWithConcurrency(
       diffChunks,
       config.diffConcurrency,
@@ -1500,7 +1627,8 @@ export async function generateCommitMessage(diff: string, signal?: AbortSignal):
           fileList: chunkFiles,
           outputTemplate: resolvedTemplate,
           titleLengthRange: config.titleLengthRange,
-          descriptionLengthRange: config.descriptionLengthRange
+          descriptionLengthRange: config.descriptionLengthRange,
+          context: promptContext
         });
         logger.info(
           `正在分析 Diff 分段 ${index + 1}/${diffChunks.length}，Diff：${chunk.length} 字符，Prompt：${prompt.length} 字符`
@@ -1508,7 +1636,7 @@ export async function generateCommitMessage(diff: string, signal?: AbortSignal):
         const contextLabel = `Diff 分段 ${index + 1}/${diffChunks.length}`;
         const result = await requestValidatedAiMessage(
           apiTarget,
-          config,
+          chunkConfig,
           config.model,
           prompt,
           chunkFiles,
@@ -1518,7 +1646,11 @@ export async function generateCommitMessage(diff: string, signal?: AbortSignal):
         if (result.usageData) {
           logUsage(apiTarget.mode, result.usageData);
         }
-        return normalizeCommitMessage(result.text, chunkFiles, resolvedTemplate);
+        completedChunks += 1;
+        if (diffChunks.length > 1) {
+          options.onProgress?.(`分析 ${completedChunks}/${diffChunks.length}`);
+        }
+        return normalizeCommitMessage(result.text, chunkFiles, resolvedTemplate, forcedType);
       },
       signal
     );
@@ -1537,18 +1669,20 @@ export async function generateCommitMessage(diff: string, signal?: AbortSignal):
 
     let normalizedMessage: string;
     if (partialMessages.length === 1) {
-      normalizedMessage = normalizeCommitMessage(partialMessages[0], changedFiles, resolvedTemplate);
+      normalizedMessage = normalizeCommitMessage(partialMessages[0], changedFiles, resolvedTemplate, forcedType);
     } else if (config.diffMergeMode === 'remote') {
+      options.onProgress?.('归并中');
       normalizedMessage = await mergeCommitMessagesRemotely(
         partialMessages,
         changedFiles,
         resolvedTemplate,
         apiTarget,
         config,
+        { userHint: promptContext.userHint, forcedType, language: config.language },
         signal
       );
     } else {
-      normalizedMessage = renderLocalMergedMessage(partialMessages, changedFiles, resolvedTemplate);
+      normalizedMessage = renderLocalMergedMessage(partialMessages, changedFiles, resolvedTemplate, forcedType);
     }
 
     logger.infoBlock('提交消息生成完成', [
@@ -1557,7 +1691,7 @@ export async function generateCommitMessage(diff: string, signal?: AbortSignal):
       { label: '输出模板', value: resolvedTemplate === DEFAULT_OUTPUT_TEMPLATE ? '默认模板' : '自定义模板' }
     ]);
 
-    return normalizedMessage;
+    return { message: normalizedMessage, forcedType };
   } catch (error) {
     if (signal?.aborted) {
       throw createAbortError();
@@ -1770,6 +1904,7 @@ async function mergeCommitMessagesRemotely(
   template: string,
   apiTarget: ResolvedApiTarget,
   config: GenerateCommitConfig,
+  context: PromptContext,
   signal?: AbortSignal
 ): Promise<string> {
   const mergeModel = config.mergeModel || config.model;
@@ -1795,7 +1930,8 @@ async function mergeCommitMessagesRemotely(
           fileList: batchFiles,
           outputTemplate: template,
           titleLengthRange: config.titleLengthRange,
-          descriptionLengthRange: config.descriptionLengthRange
+          descriptionLengthRange: config.descriptionLengthRange,
+          context
         });
         logger.info(`远程归并 Prompt 长度：${prompt.length} 字符`);
         const contextLabel = `远程归并第 ${round} 轮 ${index + 1}/${batches.length}`;
@@ -1811,7 +1947,7 @@ async function mergeCommitMessagesRemotely(
         if (result.usageData) {
           logUsage(apiTarget.mode, result.usageData);
         }
-        return normalizeCommitMessage(result.text, batchFiles, template);
+        return normalizeCommitMessage(result.text, batchFiles, template, context.forcedType);
       },
       signal
     );
@@ -1820,7 +1956,7 @@ async function mergeCommitMessagesRemotely(
   if (current.length !== 1) {
     throw new Error(`远程归并在 ${MAX_MERGE_ROUNDS} 轮内未能收敛，请增大 maxDiffLength 后重试`);
   }
-  return normalizeCommitMessage(current[0], files, template);
+  return normalizeCommitMessage(current[0], files, template, context.forcedType);
 }
 
 /**
@@ -1834,9 +1970,14 @@ function findReferencedFiles(messages: string[], files: string[]): string[] {
 /**
  * 使用本地归并结果渲染最终输出模板
  */
-function renderLocalMergedMessage(messages: string[], files: string[], template: string): string {
+function renderLocalMergedMessage(
+  messages: string[],
+  files: string[],
+  template: string,
+  forcedType?: CommitType
+): string {
   const merged = mergeCommitMessagesLocally(messages, files);
-  const title = merged.title || '🐳 chore: 更新提交信息';
+  const title = normalizeCommitTitle(merged.title || '🐳 chore: 更新提交信息', forcedType);
   const changeLines = buildChangeLines(files, merged.changes);
   return renderOutputTemplate(template, title, changeLines, files);
 }
@@ -1860,9 +2001,15 @@ function cleanMarkdownCodeBlock(text: string): string {
 /**
  * 追加“涉及组件”列表（使用本地 diff 文件清单保证准确）
  */
-function normalizeCommitMessage(message: string, files: string[], template: string): string {
+function normalizeCommitMessage(
+  message: string,
+  files: string[],
+  template: string,
+  forcedType?: CommitType
+): string {
   const trimmed = message.trim();
-  const title = extractCommitTitle(trimmed) || '🐳 chore: 更新提交信息';
+  const extractedTitle = extractCommitTitle(trimmed);
+  const title = normalizeCommitTitle(extractedTitle || '🐳 chore: 更新提交信息', forcedType);
 
   if (files.length === 0) {
     return title;
@@ -1875,4 +2022,43 @@ function normalizeCommitMessage(message: string, files: string[], template: stri
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : `${error}`;
+}
+
+/**
+ * 基于已生成的提交消息请求多个候选标题；首项始终为原标题，失败时仅返回原标题
+ */
+export async function generateTitleCandidates(
+  generated: GeneratedCommit,
+  count: number,
+  options: { context?: GenerateCommitOptions['context']; signal?: AbortSignal } = {}
+): Promise<string[]> {
+  const originalTitle = generated.message.split(/\r?\n/)[0].trim();
+  const config = getConfig();
+  const apiTarget = resolveApiTarget(config.apiEndpoint, config.apiMode);
+  const prompt = buildTitleCandidatesPrompt(generated.message, {
+    count,
+    titleLengthRange: config.titleLengthRange,
+    context: { ...options.context, forcedType: generated.forcedType, language: config.language }
+  });
+
+  try {
+    const result = await requestAiMessage(apiTarget, config, config.model, prompt, {
+      retryCount: config.retryCount,
+      timeoutMs: config.requestTimeoutMs,
+      retryStatusCodes: new Set(config.retryStatusCodes),
+      signal: options.signal
+    });
+    const titles = cleanMarkdownCodeBlock(result.text)
+      .split(/\r?\n/)
+      .map((line) => line.trim().replace(/^(?:[-*]|\d+[.、)])\s*/, ''))
+      .filter((line) => parseCommitTitle(line))
+      .map((line) => normalizeCommitTitle(line, generated.forcedType));
+    return Array.from(new Set([originalTitle, ...titles])).slice(0, count + 1);
+  } catch (error) {
+    if (options.signal?.aborted) {
+      throw createAbortError();
+    }
+    logger.warn(`候选标题生成失败，保留原标题：${getErrorMessage(error)}`);
+    return [originalTitle];
+  }
 }

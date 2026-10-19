@@ -3,10 +3,14 @@
  * @author sm
  */
 
+import { execFile } from 'child_process';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { GitExtension, Repository, GitAPI } from '../types/git';
+import { mergeFunctionContextDiff } from '../utils/diffFilter';
 import * as logger from '../utils/logger';
+
+const GIT_MAX_BUFFER = 256 * 1024 * 1024;
 
 let gitAPI: GitAPI | undefined;
 
@@ -17,6 +21,12 @@ interface ResolveRepositoryOptions {
 
 interface RepositoryQuickPickItem extends vscode.QuickPickItem {
   repository: Repository;
+}
+
+export interface GetDiffOptions {
+  staged: boolean;
+  functionContext: boolean;
+  signal?: AbortSignal;
 }
 
 /**
@@ -129,24 +139,108 @@ export async function resolveRepository(
 }
 
 /**
- * 获取暂存区的 diff
+ * 获取暂存区或工作区的 diff；开启函数级上下文时按文件合并扩展上下文，git 命令不可用时回退到 Git 扩展接口
  */
-export async function getStagedDiff(repository: Repository): Promise<string | undefined> {
+export async function getDiff(repository: Repository, options: GetDiffOptions): Promise<string | undefined> {
+  const scopeLabel = options.staged ? '暂存区' : '工作区';
+  // 标准 diff 与扩展 diff 使用相同参数，保证按文件头匹配时格式一致
+  const baseArgs = ['diff', '--no-color', '--no-ext-diff', ...(options.staged ? ['--cached'] : [])];
+  let diff: string;
+
   try {
-    // 获取暂存区的 diff（参数 true 表示只获取暂存的变更）
-    const diff = await repository.diff(true);
-
-    if (!diff || diff.trim() === '') {
-      logger.info('暂存区没有变更');
-      return undefined;
+    diff = await runGit(repository, baseArgs, options.signal);
+    if (options.functionContext && diff.trim()) {
+      try {
+        const extendedDiff = await runGit(repository, [...baseArgs, '--function-context'], options.signal);
+        const mergedDiff = mergeFunctionContextDiff(diff, extendedDiff);
+        logger.info(`已合并函数级上下文，diff 长度：${diff.length} -> ${mergedDiff.length} 字符`);
+        diff = mergedDiff;
+      } catch (error) {
+        if (options.signal?.aborted) {
+          throw error;
+        }
+        logger.warn(`获取函数级上下文失败，使用标准 diff：${(error as Error).message}`);
+      }
     }
-
-    logger.info(`获取到暂存区 diff，长度：${diff.length} 字符`);
-    return diff;
   } catch (error) {
-    logger.error('获取暂存区 diff 失败', error as Error);
-    throw error;
+    if (options.signal?.aborted) {
+      throw error;
+    }
+    logger.warn(`执行 git diff 失败，回退到 Git 扩展接口：${(error as Error).message}`);
+    try {
+      diff = await repository.diff(options.staged);
+    } catch (fallbackError) {
+      logger.error(`获取${scopeLabel} diff 失败`, fallbackError as Error);
+      throw fallbackError;
+    }
   }
+
+  if (!diff || diff.trim() === '') {
+    logger.info(`${scopeLabel}没有变更`);
+    return undefined;
+  }
+
+  logger.info(`获取到${scopeLabel} diff，长度：${diff.length} 字符`);
+  return diff;
+}
+
+/**
+ * 暂存全部变更（包含未跟踪文件）
+ */
+export async function stageAllChanges(repository: Repository, signal?: AbortSignal): Promise<void> {
+  await runGit(repository, ['add', '-A'], signal);
+  logger.info(`已暂存 ${getRepositoryLabel(repository)} 的全部变更`);
+}
+
+/**
+ * 获取近期提交消息，接口不可用或失败时返回空数组
+ */
+export async function getRecentCommitMessages(repository: Repository, count: number): Promise<string[]> {
+  if (count <= 0 || typeof repository.log !== 'function') {
+    return [];
+  }
+  try {
+    const commits = await repository.log({ maxEntries: count });
+    return commits.map((commit) => commit.message);
+  } catch (error) {
+    logger.warn(`获取近期提交失败：${(error as Error).message}`);
+    return [];
+  }
+}
+
+/**
+ * 检查工作区是否有未暂存的变更（含未跟踪文件）
+ */
+export function hasWorkingTreeChanges(repository: Repository): boolean {
+  return repository.state.workingTreeChanges.length + (repository.state.untrackedChanges?.length ?? 0) > 0;
+}
+
+/**
+ * 是否处于合并或变基过程中，此时输入框通常已被 Git 预填消息
+ */
+export function isMergeOrRebaseInProgress(repository: Repository): boolean {
+  return repository.state.mergeChanges.length > 0 || Boolean(repository.state.rebaseCommit);
+}
+
+function runGit(repository: Repository, args: string[], signal?: AbortSignal): Promise<string> {
+  if (!gitAPI) {
+    return Promise.reject(new Error('Git API 未初始化'));
+  }
+  const gitPath = gitAPI.git.path;
+  return new Promise((resolve, reject) => {
+    execFile(gitPath, args, {
+      cwd: repository.rootUri.fsPath,
+      encoding: 'utf8',
+      maxBuffer: GIT_MAX_BUFFER,
+      signal
+    }, (error, stdout) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve(stdout);
+    });
+  });
 }
 
 /**

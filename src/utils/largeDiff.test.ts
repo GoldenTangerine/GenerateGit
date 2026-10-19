@@ -16,13 +16,28 @@ import {
   extractCommitTitle,
   mapWithConcurrency,
   mergeCommitMessagesLocally,
+  normalizeCommitTitle,
   parseFileChanges,
   retryAsyncTask,
   splitDiffIntoChunks,
   validateCommitMessage
 } from './largeDiff';
 import { extractChangedFilePaths } from './diff';
-import { buildMergePrompt, buildPrompt, getDefaultMergePrompt, getDefaultPrompt } from './prompt';
+import { compactDiff, DEFAULT_SUMMARY_ONLY_PATTERNS, globToRegExp, mergeFunctionContextDiff } from './diffFilter';
+import {
+  appendIssueFooter,
+  detectForcedCommitType,
+  extractIssueFromBranch,
+  sanitizeRecentTitles,
+  sanitizeUserHint
+} from './commitContext';
+import {
+  buildMergePrompt,
+  buildPrompt,
+  buildTitleCandidatesPrompt,
+  getDefaultMergePrompt,
+  getDefaultPrompt
+} from './prompt';
 import { buildOutputTemplatePreview, DEFAULT_OUTPUT_TEMPLATE, renderOutputTemplate } from './outputTemplate';
 import {
   ANTHROPIC_API_VERSION,
@@ -33,6 +48,7 @@ import {
   extractAnthropicResponseText,
   extractAnthropicStreamText,
   extractChatCompletionStreamText,
+  extractStreamPreviewText,
   extractResponseReasoningTokens,
   extractResponseThinking,
   mergeRequestBodyOverrides,
@@ -300,14 +316,14 @@ test('模型输出需要标题和每个文件的变更描述', () => {
   });
 });
 
-test('本地归并直接拼接标题并合并重复文件描述', () => {
+test('本地归并按主导 type 选择标题并合并重复文件描述', () => {
   const messages = [
     '✨ feat(core): 新增能力\n\n变更内容：\n- [新增] src/a.ts：新增解析逻辑',
     '🐞 fix(core): 修复边界\n\n变更内容：\n- [修改] src/a.ts：修复空值处理\n- [新增] src/b.ts：补充调用逻辑'
   ];
   const result = mergeCommitMessagesLocally(messages, ['src/a.ts', 'src/b.ts']);
 
-  assert.equal(result.title, '✨ feat(core): 新增能力；🐞 fix(core): 修复边界');
+  assert.equal(result.title, '🐞 fix(core): 修复边界');
   assert.deepEqual(result.changes, [
     { file: 'src/a.ts', type: '新增', description: '新增解析逻辑' },
     { file: 'src/a.ts', type: '修改', description: '修复空值处理' },
@@ -356,6 +372,14 @@ test('标题解析兼容新旧正文标题并拒绝列表行', () => {
   assert.equal(extractCommitTitle('- [修改] src/a.ts：调整逻辑'), undefined);
 });
 
+test('标题按对照表校正 emoji 并保留无法识别的标题', () => {
+  assert.equal(normalizeCommitTitle('🌈 fix(utils)：修复空日期显示'), '🐞 fix(utils): 修复空日期显示');
+  assert.equal(normalizeCommitTitle('feat: 新增导出能力'), '✨ feat: 新增导出能力');
+  assert.equal(normalizeCommitTitle('✨ feat(api)!: 调整返回结构'), '✨ feat(api)!: 调整返回结构');
+  assert.equal(normalizeCommitTitle('🐳 constructor: 未知类型'), '🐳 constructor: 未知类型');
+  assert.equal(normalizeCommitTitle('更新提交信息'), '更新提交信息');
+});
+
 test('远程归并使用独立提示词和完整输出模板', () => {
   const prompt = buildMergePrompt(['✨ feat: 新增能力'], {
     mergePrompt: '自定义归并规则',
@@ -386,15 +410,20 @@ test('内置提示词应用标题和描述长度档位', () => {
 test('内置提示词示例符合所有标题和描述长度档位', () => {
   for (const range of ['10-20', '20-35', '35-50'] as const) {
     const prompt = getDefaultPrompt({ titleLengthRange: range });
-    const title = prompt.match(/✨ feat\(components\): (.+)/)?.[1];
-    assert.ok(title);
-    assertWithinRange(title.length, range);
+    const titles = [
+      prompt.match(/✨ feat\(components\): (.+)/)?.[1],
+      prompt.match(/🐞 fix\(utils\): (.+)/)?.[1]
+    ];
+    titles.forEach((title) => {
+      assert.ok(title);
+      assertWithinRange(title.length, range);
+    });
   }
 
   for (const range of ['10-25', '20-50', '40-80', '80-130'] as const) {
     const prompt = getDefaultPrompt({ descriptionLengthRange: range });
     const descriptions = Array.from(prompt.matchAll(/^- \[(?:新增|修改)\] .+?：(.+)$/gm), (match) => match[1]);
-    assert.equal(descriptions.length, 2);
+    assert.equal(descriptions.length, 3);
     descriptions.forEach((description) => assertWithinRange(description.length, range));
   }
 });
@@ -476,9 +505,9 @@ test('关闭内置思考时保留原有采样参数和 Chat token 字段', () =>
   ).payload;
 
   assert.equal('reasoning' in responsesPayload, false);
-  assert.equal(responsesPayload.temperature, 0.7);
+  assert.equal(responsesPayload.temperature, 0.2);
   assert.equal('reasoning_effort' in chatPayload, false);
-  assert.equal(chatPayload.temperature, 0.7);
+  assert.equal(chatPayload.temperature, 0.2);
   assert.equal(chatPayload.max_tokens, 10000);
   assert.equal('max_completion_tokens' in chatPayload, false);
 });
@@ -804,3 +833,141 @@ function assertWithinRange(length: number, range: string): void {
 function buildDiff(file: string, content: string): string {
   return `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1 +1 @@\n${content}`;
 }
+
+test('glob 规则支持任意层级、单层通配和纯文件名模式', () => {
+  assert.ok(globToRegExp('**/pnpm-lock.yaml').test('pnpm-lock.yaml'));
+  assert.ok(globToRegExp('**/pnpm-lock.yaml').test('packages/a/pnpm-lock.yaml'));
+  assert.ok(globToRegExp('**/dist/**').test('web/dist/assets/index.js'));
+  assert.ok(globToRegExp('*.min.js').test('public/vendor/jquery.min.js'));
+  assert.ok(!globToRegExp('src/*.ts').test('src/utils/a.ts'));
+  assert.ok(!globToRegExp('**/*.lock').test('src/lockscreen.ts'));
+});
+
+test('锁文件与已删除文件压缩为文件头和摘要，普通文件保持不变', () => {
+  const diff = [
+    'diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml',
+    'index 1111111..2222222 100644',
+    '--- a/pnpm-lock.yaml',
+    '+++ b/pnpm-lock.yaml',
+    '@@ -1,2 +1,3 @@',
+    ' lockfileVersion: 9',
+    '-  a: 1',
+    '+  a: 2',
+    '+  b: 1',
+    'diff --git a/src/old.ts b/src/old.ts',
+    'deleted file mode 100644',
+    'index 3333333..0000000',
+    '--- a/src/old.ts',
+    '+++ /dev/null',
+    '@@ -1,2 +0,0 @@',
+    '-export const a = 1;',
+    '-export const b = 2;',
+    'diff --git a/src/a.ts b/src/a.ts',
+    '--- a/src/a.ts',
+    '+++ b/src/a.ts',
+    '@@ -1 +1 @@',
+    '-const a = 1;',
+    '+const a = 2;',
+    ''
+  ].join('\n');
+  const result = compactDiff(diff, { summaryPatterns: DEFAULT_SUMMARY_ONLY_PATTERNS, compactDeletedFiles: true });
+
+  assert.deepEqual(result.compactedFiles, ['pnpm-lock.yaml', 'src/old.ts']);
+  assert.match(result.text, /# 依赖锁文件或生成文件，内容已省略（新增 2 行，删除 1 行）/);
+  assert.match(result.text, /deleted file mode 100644\n[\s\S]*# 文件已删除，原有 2 行内容已省略/);
+  assert.match(result.text, /-const a = 1;\n\+const a = 2;/);
+  assert.doesNotMatch(result.text, /export const b/);
+  assert.deepEqual(extractChangedFilePaths(result.text), ['pnpm-lock.yaml', 'src/old.ts', 'src/a.ts']);
+});
+
+test('函数级上下文按文件合并，膨胀超限的文件回退为标准 diff', () => {
+  const standard = 'diff --git a/a.ts b/a.ts\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/b.json b/b.json\n@@ -1 +1 @@\n-1\n+2\n';
+  const extended = 'diff --git a/a.ts b/a.ts\n@@ -1,3 +1,3 @@\n function f() {\n-x\n+y\n }\n'
+    + `diff --git a/b.json b/b.json\n@@ -1,99 +1,99 @@\n${' "k": 1,\n'.repeat(50)}-1\n+2\n`;
+  const merged = mergeFunctionContextDiff(standard, extended, 100);
+
+  assert.match(merged, /function f\(\) \{\n-x\n\+y\n \}/);
+  assert.match(merged, /diff --git a\/b\.json b\/b\.json\n@@ -1 \+1 @@/);
+  assert.equal(mergeFunctionContextDiff(standard, '', 100), standard);
+});
+
+test('全部文件同属一类时确定性判定 type', () => {
+  assert.equal(detectForcedCommitType(['README.md', 'docs/guide.mdx']), 'docs');
+  assert.equal(detectForcedCommitType(['src/utils/a.test.ts', 'tests/b.ts']), 'test');
+  assert.equal(detectForcedCommitType(['.github/workflows/release.yml']), 'ci');
+  assert.equal(detectForcedCommitType(['pnpm-lock.yaml', 'apps/web/yarn.lock']), 'build');
+  assert.equal(detectForcedCommitType(['package.json', 'pnpm-lock.yaml']), undefined);
+  assert.equal(detectForcedCommitType(['README.md', 'src/a.ts']), undefined);
+  assert.equal(detectForcedCommitType([]), undefined);
+});
+
+test('分支名提取 issue 编号并避免误判版本号', () => {
+  assert.equal(extractIssueFromBranch('feature/PROJ-123-login'), 'PROJ-123');
+  assert.equal(extractIssueFromBranch('fix/456-empty-date'), '#456');
+  assert.equal(extractIssueFromBranch('dev/#789'), '#789');
+  assert.equal(extractIssueFromBranch('release/2024-q1'), undefined);
+  assert.equal(extractIssueFromBranch('main'), undefined);
+  assert.equal(extractIssueFromBranch(undefined), undefined);
+});
+
+test('issue 引用只追加一次', () => {
+  const message = appendIssueFooter('🐞 fix: 修复空日期', '#12');
+  assert.equal(message, '🐞 fix: 修复空日期\n\nRefs: #12');
+  assert.equal(appendIssueFooter(message, '#12'), message);
+  assert.equal(appendIssueFooter('✨ feat: 新增', undefined), '✨ feat: 新增');
+  assert.match(appendIssueFooter('🐞 fix: 关联 #123', '#12'), /Refs: #12$/);
+});
+
+test('近期提交标题去掉 emoji 和 type 并过滤合并提交', () => {
+  assert.deepEqual(sanitizeRecentTitles([
+    '🌈 style(diff): 调整路径解析\n\n正文',
+    'Merge branch \'dev\'',
+    '✨ feat: 新增配置',
+    '普通提交'
+  ]), ['(diff) 调整路径解析', '新增配置', '普通提交']);
+});
+
+test('强制 type 改写标题并补全缺失的 type', () => {
+  assert.equal(normalizeCommitTitle('🌈 style(readme): 更新安装说明', 'docs'), '📃 docs(readme): 更新安装说明');
+  assert.equal(normalizeCommitTitle('更新安装说明', 'docs'), '📃 docs: 更新安装说明');
+});
+
+test('流式预览解析未结束的 Chat 与 Anthropic 响应', () => {
+  const chat = 'data: {"choices":[{"delta":{"content":"🐞 fix"}}]}\n\ndata: {"choices":[{"delta":{"content":": 修复"}}]}\n\ndata: {"choi';
+  const anthropic = 'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"✨ feat"}}\n';
+
+  assert.equal(extractStreamPreviewText(chat), '🐞 fix: 修复');
+  assert.equal(extractStreamPreviewText(anthropic), '✨ feat');
+});
+
+test('补充信息按需注入分析、归并和候选标题 Prompt', () => {
+  const context = {
+    userHint: '修复登录跳转',
+    branchName: 'fix/12-login',
+    recentTitles: ['(auth) 新增登录页'],
+    forcedType: 'docs' as const,
+    language: 'en' as const
+  };
+  const prompt = buildPrompt('diff --git a/a.md b/a.md\n', { fileList: ['a.md'], context });
+  const mergePrompt = buildMergePrompt(['📃 docs: 更新'], { fileList: ['a.md'], context: { userHint: '修复登录跳转' } });
+  const candidatesPrompt = buildTitleCandidatesPrompt('📃 docs: 更新', { count: 3, context });
+
+  assert.match(prompt, /## 补充信息\n\n- 已确定 type：docs/);
+  assert.match(prompt, /开发者填写的提交意图：修复登录跳转/);
+  assert.match(prompt, /当前分支：fix\/12-login/);
+  assert.match(prompt, /输出语言：主题和每条变更描述使用英文/);
+  assert.match(prompt, /### 仓库近期提交主题[^\n]*\n\n- \(auth\) 新增登录页\n\n## Git Diff 内容/);
+  assert.match(mergePrompt, /开发者填写的提交意图：修复登录跳转[\s\S]*## 待归并的分段结果/);
+  assert.doesNotMatch(mergePrompt, /当前分支/);
+  assert.match(candidatesPrompt, /共 3 行/);
+  assert.doesNotMatch(buildPrompt('', { fileList: [] }), /## 补充信息/);
+});
+
+test('输入框意图忽略完整提交消息和预填内容，并去掉标题中的 type', () => {
+  assert.equal(sanitizeUserHint('  修复登录后不跳转  ', 500), '修复登录后不跳转');
+  assert.equal(sanitizeUserHint('🌈 style(login): 调整跳转逻辑', 500), '(login) 调整跳转逻辑');
+  assert.equal(sanitizeUserHint('🌈 style: 调整\n\n变更内容：\n- [修改] a.ts：调整', 500), undefined);
+  assert.equal(sanitizeUserHint("Merge branch 'dev'", 500), undefined);
+  assert.equal(sanitizeUserHint('Revert "feat: 新增"', 500), undefined);
+  assert.equal(sanitizeUserHint('abcdef', 3), 'abc');
+});

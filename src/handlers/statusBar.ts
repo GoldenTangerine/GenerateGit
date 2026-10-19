@@ -47,12 +47,12 @@ export function setNormalState(): void {
 }
 
 /**
- * 设置加载状态
+ * 设置加载状态，detail 用于展示分段进度等信息
  */
-export function setLoadingState(): void {
+export function setLoadingState(detail?: string): void {
   clearRestoreTimeout();
   if (statusBarItem) {
-    statusBarItem.text = '$(loading~spin) 取消生成';
+    statusBarItem.text = detail ? `$(loading~spin) ${detail} · 取消` : '$(loading~spin) 取消生成';
     statusBarItem.command = CANCEL_GENERATION_COMMAND;
     statusBarItem.tooltip = '点击取消生成';
     statusBarItem.backgroundColor = new vscode.ThemeColor(

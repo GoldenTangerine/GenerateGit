@@ -25,6 +25,12 @@ export interface Repository {
   diffBlobs(object1: string, object2: string): Promise<string>;
   diffBetween(ref1: string, ref2: string): Promise<Change[]>;
   show(ref: string, path: string): Promise<string>;
+  log(options?: LogOptions): Promise<Commit[]>;
+}
+
+export interface LogOptions {
+  readonly maxEntries?: number;
+  readonly path?: string;
 }
 
 export interface RepositoryState {
@@ -36,6 +42,7 @@ export interface RepositoryState {
   readonly mergeChanges: Change[];
   readonly indexChanges: Change[];
   readonly workingTreeChanges: Change[];
+  readonly untrackedChanges?: Change[];
   readonly onDidChange: Event<void>;
 }
 
